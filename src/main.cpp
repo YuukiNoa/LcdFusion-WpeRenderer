@@ -9,6 +9,11 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb/stb_image_write.h>
 
+#ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -30,13 +35,51 @@ namespace
 {
 
 std::mutex g_stdoutMutex;
+HANDLE     g_pipeOut = INVALID_HANDLE_VALUE;
+
+std::wstring Utf8ToWideLocal(const std::string& s) {
+    if (s.empty()) return {};
+    int needed = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (needed <= 0) return {};
+    std::wstring out(static_cast<std::size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), needed);
+    return out;
+}
+
+HANDLE OpenNamedPipeWithRetry(const std::string& pipePathUtf8, DWORD access) {
+    std::wstring wide = Utf8ToWideLocal(pipePathUtf8);
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        HANDLE h = CreateFileW(wide.c_str(), access, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) return h;
+        DWORD err = GetLastError();
+        if (err == ERROR_PIPE_BUSY || err == ERROR_FILE_NOT_FOUND) {
+            Sleep(25);
+            continue;
+        }
+        return INVALID_HANDLE_VALUE;
+    }
+    return INVALID_HANDLE_VALUE;
+}
 
 void EmitJson(const json& obj) {
     std::string line = obj.dump(-1, ' ', false, json::error_handler_t::replace);
     line.push_back('\n');
     std::lock_guard<std::mutex> lock(g_stdoutMutex);
-    std::fwrite(line.data(), 1, line.size(), stdout);
-    std::fflush(stdout);
+    if (g_pipeOut != INVALID_HANDLE_VALUE) {
+        const char* ptr = line.data();
+        std::size_t rem = line.size();
+        while (rem > 0) {
+            DWORD written = 0;
+            DWORD chunk   = static_cast<DWORD>(std::min<std::size_t>(rem, 65536));
+            if (! WriteFile(g_pipeOut, ptr, chunk, &written, nullptr) || written == 0) break;
+            ptr += written;
+            rem -= written;
+        }
+        FlushFileBuffers(g_pipeOut);
+    } else {
+        std::fwrite(line.data(), 1, line.size(), stdout);
+        std::fflush(stdout);
+    }
 }
 
 void EmitReady(uint32_t width, uint32_t height) {
@@ -178,36 +221,72 @@ int RunDumpMode(int argc, char** argv) {
     return 0;
 }
 
-int RunIpcMode() {
+int RunIpcMode(const std::string& pipeBaseName) {
+    HANDLE hPipeIn = INVALID_HANDLE_VALUE;
+    if (! pipeBaseName.empty()) {
+        std::string inPath  = "\\\\.\\pipe\\" + pipeBaseName + "_in";
+        std::string outPath = "\\\\.\\pipe\\" + pipeBaseName + "_out";
+        hPipeIn             = OpenNamedPipeWithRetry(inPath, GENERIC_READ);
+        if (hPipeIn == INVALID_HANDLE_VALUE) {
+            std::fprintf(stderr, "Failed to open IPC input pipe: %s (err=%lu)\n", inPath.c_str(), GetLastError());
+            return 3;
+        }
+        g_pipeOut = OpenNamedPipeWithRetry(outPath, GENERIC_WRITE);
+        if (g_pipeOut == INVALID_HANDLE_VALUE) {
+            std::fprintf(stderr, "Failed to open IPC output pipe: %s (err=%lu)\n", outPath.c_str(), GetLastError());
+            CloseHandle(hPipeIn);
+            return 3;
+        }
+    }
+
     std::mutex              cmdMutex;
     std::condition_variable cmdCv;
     std::deque<json>        cmdQueue;
     bool                    stdinClosed = false;
 
-    std::thread readerThread([&]() {
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            // Strip CR if present
-            if (! line.empty() && line.back() == '\r') line.pop_back();
-            // Strip UTF-8 BOM if accidentally sent on first line
-            if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
-                static_cast<unsigned char>(line[1]) == 0xBB &&
-                static_cast<unsigned char>(line[2]) == 0xBF) {
-                line.erase(0, 3);
-            }
-            if (line.empty()) continue;
+    auto processLine = [&](std::string line) {
+        // Strip CR if present
+        if (! line.empty() && line.back() == '\r') line.pop_back();
+        // Strip UTF-8 BOM if accidentally sent on first line
+        if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
+            line.erase(0, 3);
+        }
+        if (line.empty()) return;
 
-            try {
-                auto obj = json::parse(line);
-                if (obj.is_object()) {
-                    {
-                        std::lock_guard<std::mutex> lock(cmdMutex);
-                        cmdQueue.push_back(std::move(obj));
-                    }
-                    cmdCv.notify_one();
+        try {
+            auto obj = json::parse(line);
+            if (obj.is_object()) {
+                {
+                    std::lock_guard<std::mutex> lock(cmdMutex);
+                    cmdQueue.push_back(std::move(obj));
                 }
-            } catch (const std::exception& ex) {
-                EmitError("BAD_JSON", ex.what());
+                cmdCv.notify_one();
+            }
+        } catch (const std::exception& ex) {
+            EmitError("BAD_JSON", ex.what());
+        }
+    };
+
+    std::thread readerThread([&]() {
+        if (hPipeIn != INVALID_HANDLE_VALUE) {
+            std::string acc;
+            char        buf[4096];
+            DWORD       bytesRead = 0;
+            while (ReadFile(hPipeIn, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
+                acc.append(buf, bytesRead);
+                std::size_t nl = 0;
+                while ((nl = acc.find('\n')) != std::string::npos) {
+                    processLine(acc.substr(0, nl));
+                    acc.erase(0, nl + 1);
+                }
+            }
+            if (! acc.empty()) processLine(acc);
+        } else {
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                processLine(std::move(line));
             }
         }
         {
@@ -367,8 +446,20 @@ int RunIpcMode() {
 
     shm.Close();
     engine.Shutdown();
+    {
+        std::lock_guard<std::mutex> lock(g_stdoutMutex);
+        if (g_pipeOut != INVALID_HANDLE_VALUE) {
+            CloseHandle(g_pipeOut);
+            g_pipeOut = INVALID_HANDLE_VALUE;
+        }
+    }
+    if (hPipeIn != INVALID_HANDLE_VALUE) {
+        CancelIoEx(hPipeIn, nullptr);
+        CloseHandle(hPipeIn);
+        hPipeIn = INVALID_HANDLE_VALUE;
+    }
     if (readerThread.joinable()) {
-        // On normal quit command stdin might still be open; detach if host hasn't closed pipe yet.
+        // On normal quit command stdin/pipe might still be open; detach if host hasn't closed pipe yet.
         readerThread.detach();
     }
     return 0;
@@ -377,19 +468,23 @@ int RunIpcMode() {
 } // namespace
 
 int main(int argc, char** argv) {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
 
-    bool ipcMode = false;
+    bool        ipcMode      = false;
+    std::string ipcPipeBase;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--ipc") == 0) {
             ipcMode = true;
-            break;
+        } else if (std::strcmp(argv[i], "--ipc-pipe") == 0 && i + 1 < argc) {
+            ipcMode     = true;
+            ipcPipeBase = argv[++i];
         }
     }
 
     if (ipcMode) {
-        return RunIpcMode();
+        return RunIpcMode(ipcPipeBase);
     }
     return RunDumpMode(argc, argv);
 }
