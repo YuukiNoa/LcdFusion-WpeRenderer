@@ -158,12 +158,21 @@ target_link_libraries(wescene-core PUBLIC
 
 # Standalone offscreen renderer executable (x64)
 add_executable(wpe-renderer
+    src/AudioSpectrumWin32.cpp
+    src/VideoPlayerWin32.cpp
     src/ShmWriter.cpp
     src/RendererEngine.cpp
     src/main.cpp
 )
 
-target_link_libraries(wpe-renderer PRIVATE wescene-core)
+target_link_libraries(wpe-renderer PRIVATE
+    wescene-core
+    mfplat
+    mfreadwrite
+    mfuuid
+    ole32
+    uuid
+)
 
 if(MINGW)
     find_library(WINPTHREAD_STATIC_LIB NAMES libwinpthread.a REQUIRED)

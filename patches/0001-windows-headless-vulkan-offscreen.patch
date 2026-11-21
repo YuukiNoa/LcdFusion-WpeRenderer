@@ -172,6 +172,24 @@ index 7087094..c3b5104 100644
  
          // a_PositionVec4: start pos
          AssignVertexTimes({ data + offset, totle_size },
+diff --git a/src/SpecTexs.hpp b/src/SpecTexs.hpp
+index 3edbd82..b607893 100644
+--- a/src/SpecTexs.hpp
++++ b/src/SpecTexs.hpp
+@@ -71,6 +71,13 @@ constexpr std::string_view G_BONES { "g_Bones" };
+ constexpr std::string_view G_SCREEN { "g_Screen" };
+ constexpr std::string_view G_PARALLAXPOSITION { "g_ParallaxPosition" };
+ 
++constexpr std::string_view G_AUDIO_SPECTRUM_16_LEFT { "g_AudioSpectrum16Left" };
++constexpr std::string_view G_AUDIO_SPECTRUM_16_RIGHT { "g_AudioSpectrum16Right" };
++constexpr std::string_view G_AUDIO_SPECTRUM_32_LEFT { "g_AudioSpectrum32Left" };
++constexpr std::string_view G_AUDIO_SPECTRUM_32_RIGHT { "g_AudioSpectrum32Right" };
++constexpr std::string_view G_AUDIO_SPECTRUM_64_LEFT { "g_AudioSpectrum64Left" };
++constexpr std::string_view G_AUDIO_SPECTRUM_64_RIGHT { "g_AudioSpectrum64Right" };
++
+ constexpr std::string_view SpecTex_Default { "_rt_default" };
+ constexpr std::string_view SpecTex_Link { "_rt_link_" };
+ 
 diff --git a/src/Utils/Algorism.cpp b/src/Utils/Algorism.cpp
 index 3156eb8..77aa190 100644
 --- a/src/Utils/Algorism.cpp
@@ -1656,7 +1674,7 @@ index 487c9f9..e8a0c5d 100644
  
      LoadEmitter(*particleSub, particle_obj, override.count, render_rope);
 diff --git a/src/WPShaderParser.cpp b/src/WPShaderParser.cpp
-index 7c3eaec..28dc101 100644
+index 7c3eaec..72ee0a3 100644
 --- a/src/WPShaderParser.cpp
 +++ b/src/WPShaderParser.cpp
 @@ -28,6 +28,7 @@ namespace
@@ -1795,7 +1813,47 @@ index 7c3eaec..28dc101 100644
  inline std::string GenSha1(std::span<const WPShaderUnit> units) {
      std::string shas;
      for (auto& unit : units) {
-@@ -473,6 +595,9 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
+@@ -470,9 +592,49 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
+ 
+             unit.src = Finalprocessor(unit, pre_info, post_info);
+ 
++            // Vulkan GLSL rejects implicit float->int conversion in desktop-GLSL-authored loops
++            // like `for (int i = u_MinFreqRange; i < u_MaxFreqRange; i++)`.
++            {
++                std::set<std::string> floatUniforms;
++                const std::regex      reFloatUni(R"(\buniform\s+(?:highp|mediump|lowp\s+)?float\s+([A-Za-z_]\w*)\s*;)");
++                for (std::sregex_iterator it(unit.src.begin(), unit.src.end(), reFloatUni), end;
++                     it != end;
++                     ++it) {
++                    floatUniforms.insert((*it)[1].str());
++                }
++                if (! floatUniforms.empty()) {
++                    const std::regex reForInit(
++                        R"(\bfor\s*\(\s*int\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;\s*([A-Za-z_]\w*)\s*(<=?|>=?)\s*([A-Za-z_]\w*)\s*;)");
++                    std::string patched;
++                    std::size_t last = 0;
++                    for (std::sregex_iterator it(unit.src.begin(), unit.src.end(), reForInit), end;
++                         it != end;
++                         ++it) {
++                        const auto& m     = *it;
++                        std::string initV = m[2].str();
++                        std::string cmpV  = m[5].str();
++                        bool        castI = floatUniforms.count(initV) > 0;
++                        bool        castC = floatUniforms.count(cmpV) > 0;
++                        if (! castI && ! castC) continue;
++                        patched.append(unit.src, last, static_cast<std::size_t>(m.position()) - last);
++                        patched += "for (int " + m[1].str() + " = " +
++                                   (castI ? ("int(" + initV + ")") : initV) + "; " + m[3].str() + " " +
++                                   m[4].str() + " " + (castC ? ("int(" + cmpV + ")") : cmpV) + ";";
++                        last = static_cast<std::size_t>(m.position() + m.length());
++                    }
++                    if (last > 0) {
++                        patched.append(unit.src, last, std::string::npos);
++                        unit.src.swap(patched);
++                    }
++                }
++            }
++
              vunit.src   = unit.src;
              vunit.stage = ToGLSL(unit.stage);
          }
@@ -1805,3 +1863,146 @@ index 7c3eaec..28dc101 100644
  
          vulkan::ShaderCompOpt opt;
          opt.client_ver             = glslang::EShTargetVulkan_1_1;
+diff --git a/src/WPShaderValueUpdater.cpp b/src/WPShaderValueUpdater.cpp
+index 4a1025e..26c7fe8 100644
+--- a/src/WPShaderValueUpdater.cpp
++++ b/src/WPShaderValueUpdater.cpp
+@@ -72,6 +72,12 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
+     info.has_TEXELSIZEHALF    = existsOp(G_TEXELSIZEHALF);
+     info.has_SCREEN           = existsOp(G_SCREEN);
+     info.has_LP               = existsOp(G_LP);
++    info.has_AUDIO16L         = existsOp(G_AUDIO_SPECTRUM_16_LEFT);
++    info.has_AUDIO16R         = existsOp(G_AUDIO_SPECTRUM_16_RIGHT);
++    info.has_AUDIO32L         = existsOp(G_AUDIO_SPECTRUM_32_LEFT);
++    info.has_AUDIO32R         = existsOp(G_AUDIO_SPECTRUM_32_RIGHT);
++    info.has_AUDIO64L         = existsOp(G_AUDIO_SPECTRUM_64_LEFT);
++    info.has_AUDIO64R         = existsOp(G_AUDIO_SPECTRUM_64_RIGHT);
+ 
+     std::accumulate(begin(info.texs), end(info.texs), 0, [&existsOp](uint index, auto& value) {
+         value.has_resolution = existsOp(WE_GLTEX_RESOLUTION_NAMES[index]);
+@@ -235,6 +241,33 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
+         updateOp(G_LP, lights);
+         updateOp(G_LCP, lights_color);
+     }
++
++    if (info.has_AUDIO16L) updateOp(G_AUDIO_SPECTRUM_16_LEFT, ShaderValue(m_audio16L));
++    if (info.has_AUDIO16R) updateOp(G_AUDIO_SPECTRUM_16_RIGHT, ShaderValue(m_audio16R));
++    if (info.has_AUDIO32L) updateOp(G_AUDIO_SPECTRUM_32_LEFT, ShaderValue(m_audio32L));
++    if (info.has_AUDIO32R) updateOp(G_AUDIO_SPECTRUM_32_RIGHT, ShaderValue(m_audio32R));
++    if (info.has_AUDIO64L) updateOp(G_AUDIO_SPECTRUM_64_LEFT, ShaderValue(m_audio64L));
++    if (info.has_AUDIO64R) updateOp(G_AUDIO_SPECTRUM_64_RIGHT, ShaderValue(m_audio64R));
++}
++
++void WPShaderValueUpdater::SetAudioSpectrum(const std::array<float, 64>& left64,
++                                            const std::array<float, 64>& right64,
++                                            const std::array<float, 32>& left32,
++                                            const std::array<float, 32>& right32,
++                                            const std::array<float, 16>& left16,
++                                            const std::array<float, 16>& right16) {
++    for (std::size_t i = 0; i < 64; ++i) {
++        m_audio64L[i * 4] = left64[i];
++        m_audio64R[i * 4] = right64[i];
++    }
++    for (std::size_t i = 0; i < 32; ++i) {
++        m_audio32L[i * 4] = left32[i];
++        m_audio32R[i * 4] = right32[i];
++    }
++    for (std::size_t i = 0; i < 16; ++i) {
++        m_audio16L[i * 4] = left16[i];
++        m_audio16R[i * 4] = right16[i];
++    }
+ }
+ 
+ void WPShaderValueUpdater::SetNodeData(void* nodeAddr, const WPShaderValueData& data) {
+diff --git a/src/WPShaderValueUpdater.hpp b/src/WPShaderValueUpdater.hpp
+index 3d5729c..c165265 100644
+--- a/src/WPShaderValueUpdater.hpp
++++ b/src/WPShaderValueUpdater.hpp
+@@ -39,6 +39,13 @@ struct WPUniformInfo {
+     bool has_SCREEN { false };
+     bool has_LP { false };
+ 
++    bool has_AUDIO16L { false };
++    bool has_AUDIO16R { false };
++    bool has_AUDIO32L { false };
++    bool has_AUDIO32R { false };
++    bool has_AUDIO64L { false };
++    bool has_AUDIO64R { false };
++
+     struct Tex {
+         bool has_resolution { false };
+         bool has_mipmap { false };
+@@ -79,6 +86,10 @@ public:
+ 
+     void SetScreenSize(i32 w, i32 h) override { m_screen_size = { (float)w, (float)h }; }
+ 
++    void SetAudioSpectrum(const std::array<float, 64>& left64, const std::array<float, 64>& right64,
++                          const std::array<float, 32>& left32, const std::array<float, 32>& right32,
++                          const std::array<float, 16>& left16, const std::array<float, 16>& right16);
++
+ private:
+     Scene*               m_scene;
+     WPCameraParallax     m_parallax;
+@@ -94,6 +105,14 @@ private:
+ 
+     std::array<float, 2> m_screen_size { 1920, 1080 };
+ 
++    // std140-padded audio spectrum buffers (stride 16 bytes = 4 floats per element)
++    std::array<float, 16 * 4> m_audio16L {};
++    std::array<float, 16 * 4> m_audio16R {};
++    std::array<float, 32 * 4> m_audio32L {};
++    std::array<float, 32 * 4> m_audio32R {};
++    std::array<float, 64 * 4> m_audio64L {};
++    std::array<float, 64 * 4> m_audio64R {};
++
+     Map<void*, WPShaderValueData> m_nodeDataMap;
+     Map<void*, WPUniformInfo>     m_nodeUniformInfoMap;
+ };
+diff --git a/src/WPTexImageParser.cpp b/src/WPTexImageParser.cpp
+index ec396e4..4c40869 100644
+--- a/src/WPTexImageParser.cpp
++++ b/src/WPTexImageParser.cpp
+@@ -110,7 +110,12 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
+ 
+     header.count = file.ReadInt32();
+ 
+-    if (header.extraHeader["texb"].val == 3) header.type = static_cast<ImageType>(file.ReadInt32());
++    if (header.extraHeader["texb"].val >= 3) {
++        header.type = static_cast<ImageType>(file.ReadInt32());
++    }
++    if (header.extraHeader["texb"].val >= 4) {
++        header.extraHeader["isVideoMp4"].val = file.ReadInt32();
++    }
+ }
+ 
+ void SetHeaderPow2(ImageHeader& header, i32 mip_0_w, i32 mip_0_h) {
+@@ -184,11 +189,26 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
+                     return nullptr;
+                 }
+             }
+-            // is image container
+-            if (img.header.extraHeader["texb"].val == 3 && img.header.type != ImageType::UNKNOWN) {
+-                int32_t w, h, n;
++            // is image container (TEXB0003 / TEXB0004)
++            if (img.header.extraHeader["texb"].val >= 3 && img.header.type != ImageType::UNKNOWN) {
++                int32_t w = 0, h = 0, n = 0;
+                 auto*   data =
+                     stbi_load_from_memory((const unsigned char*)result, src_size, &w, &h, &n, 4);
++                if (data == nullptr || w <= 0 || h <= 0) {
++                    LOG_ERROR("stbi_load_from_memory failed for tex \"%s\" (type=%d, size=%d)",
++                              name.c_str(),
++                              static_cast<int>(img.header.type),
++                              src_size);
++                    delete[] result;
++                    return nullptr;
++                }
++                mipmap.width  = w;
++                mipmap.height = h;
++                if (i_mipmap == 0) {
++                    img_slot.width  = w;
++                    img_slot.height = h;
++                    SetHeaderPow2(img.header, w, h);
++                }
+                 mipmap.data = ImageDataPtr((uint8_t*)data, [](uint8_t* data) {
+                     stbi_image_free((unsigned char*)data);
+                 });

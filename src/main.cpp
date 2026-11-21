@@ -82,12 +82,12 @@ void EmitJson(const json& obj) {
     }
 }
 
-void EmitReady(uint32_t width, uint32_t height) {
+void EmitReady(uint32_t width, uint32_t height, const std::string& backend) {
     EmitJson({
         { "event", "ready" },
         { "width", width },
         { "height", height },
-        { "backend", "vulkan-x64" },
+        { "backend", backend.empty() ? "vulkan-x64" : backend },
     });
 }
 
@@ -123,6 +123,7 @@ int RunDumpMode(int argc, char** argv) {
     req.fps    = 30;
     std::string dumpPath = "dump.png";
     int         frames   = 10;
+    bool        testAudio = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -134,6 +135,10 @@ int RunDumpMode(int argc, char** argv) {
             req.dir = nextVal();
         else if (arg == "--assets")
             req.assets = nextVal();
+        else if (arg == "--props")
+            req.initialPropsJson = nextVal();
+        else if (arg == "--test-audio")
+            testAudio = true;
         else if (arg == "--width")
             req.width = ClampDim(std::atoi(nextVal().c_str()), 480);
         else if (arg == "--height")
@@ -144,12 +149,12 @@ int RunDumpMode(int argc, char** argv) {
             dumpPath = nextVal();
     }
 
-    if (req.dir.empty() || req.assets.empty()) {
+    if (req.dir.empty()) {
         std::fprintf(stderr,
                      "Usage:\n"
-                     "  wpe-renderer --ipc\n"
-                     "  wpe-renderer --dir <wallpaper_dir> --assets <wpe_assets_dir> "
-                     "[--width 480] [--height 480] [--frames 10] [--dump out.png]\n");
+                     "  wpe-renderer --ipc | --ipc-pipe <base>\n"
+                     "  wpe-renderer --dir <wallpaper_dir> [--assets <wpe_assets_dir>] "
+                     "[--width 480] [--height 480] [--frames 10] [--props <json>] [--test-audio] [--dump out.png]\n");
         return 2;
     }
 
@@ -172,6 +177,9 @@ int RunDumpMode(int argc, char** argv) {
     if (! engine.Load(req, err, code)) {
         std::fprintf(stderr, "Load failed [%s]: %s\n", code.c_str(), err.c_str());
         return 1;
+    }
+    if (testAudio) {
+        engine.InjectTestAudioTone(440.0f, 0.9f);
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -359,6 +367,9 @@ int RunIpcMode(const std::string& pipeBaseName) {
                 req.width   = ClampDim(msg.value("width", 480), 480);
                 req.height  = ClampDim(msg.value("height", 480), 480);
                 req.fps     = ClampFps(msg.value("fps", 30), 30);
+                if (msg.contains("props") && msg["props"].is_object()) {
+                    req.initialPropsJson = msg["props"].dump();
+                }
                 targetFps   = req.fps;
 
                 std::string err, code;
@@ -374,13 +385,14 @@ int RunIpcMode(const std::string& pipeBaseName) {
                 }
 
                 paused = false;
+                engine.SetPaused(false);
                 shm.SetState(lcdfusion_wpe::kShmStateRunning);
                 lastFrame = std::chrono::steady_clock::now();
                 nextFrame = lastFrame;
 
                 // Render initial frame immediately so host has valid pixels right after ready
                 engine.RenderFrame(1.0 / static_cast<double>(targetFps));
-                EmitReady(req.width, req.height);
+                EmitReady(req.width, req.height, engine.BackendName());
             } else if (cmd == "resize") {
                 uint32_t    newW    = ClampDim(msg.value("width", static_cast<int>(engine.Width())), 480);
                 uint32_t    newH    = ClampDim(msg.value("height", static_cast<int>(engine.Height())), 480);
@@ -409,10 +421,11 @@ int RunIpcMode(const std::string& pipeBaseName) {
                 }
                 lastFrame = std::chrono::steady_clock::now();
                 nextFrame = lastFrame;
-                EmitReady(newW, newH);
+                EmitReady(newW, newH, engine.BackendName());
             } else if (cmd == "pause") {
                 bool val = msg.value("value", false);
                 paused   = val;
+                engine.SetPaused(paused);
                 shm.SetState(paused ? lcdfusion_wpe::kShmStatePaused
                                     : lcdfusion_wpe::kShmStateRunning);
                 if (! paused) {
@@ -421,8 +434,17 @@ int RunIpcMode(const std::string& pipeBaseName) {
                 }
                 EmitStatus(paused ? "paused" : "running");
             } else if (cmd == "props") {
-                // Reserved for M4 dynamic user property overrides.
-                EmitStatus("props_ack");
+                if (msg.contains("values") && msg["values"].is_object()) {
+                    std::string err;
+                    if (! engine.SetProperties(msg["values"].dump(), err)) {
+                        EmitError("PROPS_FAILED", err);
+                        continue;
+                    }
+                    if (engine.IsLoaded() && ! paused) {
+                        engine.RenderFrame(1.0 / static_cast<double>(targetFps));
+                    }
+                }
+                EmitStatus("props_applied");
             }
         }
 
