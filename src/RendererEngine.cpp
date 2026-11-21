@@ -25,6 +25,7 @@
 #include <cmath>
 #include <filesystem>
 #include <sstream>
+#include <unordered_map>
 
 namespace lcdfusion_wpe
 {
@@ -90,36 +91,73 @@ bool TryJsonToDouble(const nlohmann::json& j, double& out) {
 }
 
 // Recursively substitutes Wallpaper Engine `"user": "<prop>"` / `"user": {"name": "...", "condition": "..."}`
-// bindings inside scene.json before passing it to WPSceneParser.
-void ApplyUserPropertiesRecursive(nlohmann::json& node, const nlohmann::json& userProps) {
+// bindings inside scene.json before passing it to WPSceneParser (case-insensitive property key lookup).
+void ApplyUserPropertiesRecursive(
+    nlohmann::json&                                      node,
+    const std::unordered_map<std::string, nlohmann::json>& userPropsLower) {
     if (node.is_array()) {
-        for (auto& el : node) ApplyUserPropertiesRecursive(el, userProps);
+        for (auto& el : node) ApplyUserPropertiesRecursive(el, userPropsLower);
         return;
     }
     if (! node.is_object()) return;
 
-    if (node.contains("user") && node.contains("value")) {
+    auto applyTypedValue = [](nlohmann::json& dest, const nlohmann::json& ov) {
+        if (dest.is_boolean()) {
+            dest = JsonToBool(ov, dest.get<bool>());
+        } else if (dest.is_number()) {
+            double d = 0.0;
+            if (TryJsonToDouble(ov, d)) dest = d;
+        } else if (dest.is_string()) {
+            std::string orig = dest.get<std::string>();
+            if (ov.is_number()) {
+                // If original string is a multi-component vector like "1 1" or "1 1 1" and override is a scalar slider,
+                // replicate the scalar across components so WPJson's array parser succeeds.
+                std::istringstream iss(orig);
+                std::string        tok;
+                int                compCount = 0;
+                bool               allNums   = true;
+                while (iss >> tok) {
+                    ++compCount;
+                    try {
+                        std::size_t idx = 0;
+                        (void)std::stod(tok, &idx);
+                        if (idx != tok.size()) allNums = false;
+                    } catch (...) {
+                        allNums = false;
+                    }
+                }
+                if (allNums && compCount >= 2 && compCount <= 4) {
+                    std::string s = JsonScalarToString(ov);
+                    std::string joined;
+                    for (int i = 0; i < compCount; ++i) {
+                        if (i > 0) joined.push_back(' ');
+                        joined += s;
+                    }
+                    dest = joined;
+                    return;
+                }
+            }
+            dest = JsonScalarToString(ov);
+        } else {
+            dest = ov;
+        }
+    };
+
+    if (node.contains("user")) {
         const auto& u = node["user"];
         if (u.is_string()) {
-            std::string key = u.get<std::string>();
-            if (userProps.contains(key)) {
-                const auto& ov   = userProps[key];
-                auto&       dest = node["value"];
-                if (dest.is_boolean()) {
-                    dest = JsonToBool(ov, dest.get<bool>());
-                } else if (dest.is_number()) {
-                    double d = 0.0;
-                    if (TryJsonToDouble(ov, d)) dest = d;
-                } else if (dest.is_string()) {
-                    dest = JsonScalarToString(ov);
+            auto it = userPropsLower.find(ToLowerAscii(u.get<std::string>()));
+            if (it != userPropsLower.end()) {
+                if (node.contains("value")) {
+                    applyTypedValue(node["value"], it->second);
                 } else {
-                    dest = ov;
+                    node["value"] = it->second;
                 }
             }
         } else if (u.is_object() && u.contains("name") && u["name"].is_string()) {
-            std::string key = u["name"].get<std::string>();
-            if (userProps.contains(key)) {
-                const auto& ov = userProps[key];
+            auto it = userPropsLower.find(ToLowerAscii(u["name"].get<std::string>()));
+            if (it != userPropsLower.end()) {
+                const auto& ov = it->second;
                 if (u.contains("condition")) {
                     std::string cond = JsonScalarToString(u["condition"]);
                     std::string cur  = JsonScalarToString(ov);
@@ -128,18 +166,10 @@ void ApplyUserPropertiesRecursive(nlohmann::json& node, const nlohmann::json& us
                         eq = (JsonToBool(ov, false) == JsonToBool(u["condition"], false));
                     }
                     node["value"] = eq;
+                } else if (node.contains("value")) {
+                    applyTypedValue(node["value"], ov);
                 } else {
-                    auto& dest = node["value"];
-                    if (dest.is_boolean()) {
-                        dest = JsonToBool(ov, dest.get<bool>());
-                    } else if (dest.is_number()) {
-                        double d = 0.0;
-                        if (TryJsonToDouble(ov, d)) dest = d;
-                    } else if (dest.is_string()) {
-                        dest = JsonScalarToString(ov);
-                    } else {
-                        dest = ov;
-                    }
+                    node["value"] = ov;
                 }
             }
         }
@@ -147,7 +177,7 @@ void ApplyUserPropertiesRecursive(nlohmann::json& node, const nlohmann::json& us
 
     for (auto it = node.begin(); it != node.end(); ++it) {
         if (it.key() == "user") continue;
-        ApplyUserPropertiesRecursive(it.value(), userProps);
+        ApplyUserPropertiesRecursive(it.value(), userPropsLower);
     }
 }
 
@@ -158,8 +188,13 @@ std::string ApplyUserPropsToSceneSource(const std::string& rawSceneSrc,
         auto props = nlohmann::json::parse(userPropsJson);
         if (! props.is_object() || props.empty()) return rawSceneSrc;
 
+        std::unordered_map<std::string, nlohmann::json> lowerMap;
+        for (auto it = props.begin(); it != props.end(); ++it) {
+            lowerMap[ToLowerAscii(it.key())] = it.value();
+        }
+
         auto sceneJson = nlohmann::json::parse(rawSceneSrc);
-        ApplyUserPropertiesRecursive(sceneJson, props);
+        ApplyUserPropertiesRecursive(sceneJson, lowerMap);
         return sceneJson.dump();
     } catch (const std::exception& ex) {
         LOG_ERROR("ApplyUserPropsToSceneSource warning: %s", ex.what());
