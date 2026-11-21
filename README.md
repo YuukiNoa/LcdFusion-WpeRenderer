@@ -1,0 +1,53 @@
+# LcdFusion-WpeRenderer
+
+Standalone **x64 headless Vulkan offscreen Scene renderer** (`wpe-renderer.exe`) for [LcdFusion](../LcdFusion), licensed under **GPL-2.0** (matching upstream `catsout/wallpaper-scene-renderer`).
+
+## Architecture & Isolation
+
+- **Process & License Isolation**: Runs as an independent x64 child process communicating with `LcdFusion.exe` (x86, MIT) strictly over the public IPC protocol (`LcdFusion/docs/wpe-renderer-ipc.md`). Never commit or bundle this GPL-2.0 binary into the MIT `LcdFusion` repository or portable zip.
+- **Privilege Isolation**: When `LcdFusion.exe` runs elevated under UAC (High Integrity), it launches `wpe-renderer.exe` using a restricted Medium Integrity LUA token (`CreateRestrictedToken` + `CreateProcessAsUserW` + explicit stdio handle list) and stamps a Medium Mandatory Label (`S:(ML;;NW;;;ME)`) onto the scoped-DACL shared memory mapping. `ShmWriter` requests minimum required access (`FILE_MAP_READ | FILE_MAP_WRITE`).
+- **Headless Vulkan 1.1+ Offscreen Rendering**: Renders Wallpaper Engine Scene wallpapers directly into `VK_FORMAT_B8G8R8A8_UNORM` offscreen images and copies frames via persistently-mapped `HOST_VISIBLE | HOST_COHERENT` staging buffers into double-buffered Windows shared memory (`Local\LcdFusion_Wpe_*`).
+- **No Bundled Assets**: Never packages or distributes Wallpaper Engine `assets/` or Workshop wallpapers; reads user-owned Steam directories at runtime.
+
+## Upstream Source & Patch
+
+Built on top of [`catsout/wallpaper-scene-renderer`](https://github.com/catsout/wallpaper-scene-renderer) at commit `8dde7e7` (with `third_party/SPIRV-Reflect`), plus [`patches/0001-windows-headless-vulkan-offscreen.patch`](patches/0001-windows-headless-vulkan-offscreen.patch).
+
+To prepare a fresh checkout:
+
+```powershell
+./scripts/setup-upstream.ps1
+```
+
+## Building (MSYS2 UCRT64)
+
+Prerequisites in `C:\msys64\ucrt64`: GCC/C++20, CMake, Ninja, Vulkan Headers/Loader, `glslang`, `SPIRV-Tools`, `Eigen3`, `nlohmann-json`, `liblz4`, `stb`.
+
+```powershell
+$env:PATH = "C:\msys64\ucrt64\bin;" + $env:PATH
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j 8
+```
+
+This produces a standalone `build\wpe-renderer.exe` with no MSYS2 runtime DLL dependencies (depends only on `KERNEL32.dll`, `api-ms-win-crt-*`, and `vulkan-1.dll`).
+
+## Installation into LcdFusion
+
+Copy `build\wpe-renderer.exe` to `<LcdFusionDir>\renderer\wpe-renderer.exe` (or pick the executable manually inside LcdFusion's Wallpaper dialog).
+
+## Standalone GPL-2.0 Packaging
+
+```powershell
+./scripts/pack-renderer.ps1 -Version 0.1.0
+```
+
+Produces `LcdFusion-WpeRenderer-<Version>-win-x64.zip` containing `renderer\wpe-renderer.exe`, `LICENSE.txt` (GPL-2.0), `README.md`, and `patches\`.
+
+## CLI Verification Mode
+
+```powershell
+./build/wpe-renderer.exe `
+  --dir "C:/Program Files (x86)/Steam/steamapps/workshop/content/431960/<id>" `
+  --assets "C:/Program Files (x86)/Steam/steamapps/common/wallpaper_engine/assets" `
+  --width 480 --height 480 --frames 60 --dump test.png
+```

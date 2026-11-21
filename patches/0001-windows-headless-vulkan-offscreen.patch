@@ -1,0 +1,1807 @@
+diff --git a/src/Fs/include/Fs/CBinaryStream.h b/src/Fs/include/Fs/CBinaryStream.h
+index 0fe0feb..b49effe 100644
+--- a/src/Fs/include/Fs/CBinaryStream.h
++++ b/src/Fs/include/Fs/CBinaryStream.h
+@@ -50,19 +50,44 @@ private:
+     std::FILE*  m_file;
+ };
+ 
++inline std::filesystem::path Utf8ToFsPath(std::string_view utf8) {
++#ifdef _WIN32
++    return std::filesystem::path(
++        std::u8string_view(reinterpret_cast<const char8_t*>(utf8.data()), utf8.size()));
++#else
++    return std::filesystem::path(utf8);
++#endif
++}
++
++inline std::string FsPathToUtf8(const std::filesystem::path& p) {
++#ifdef _WIN32
++    auto u8 = p.u8string();
++    return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
++#else
++    return p.string();
++#endif
++}
++
+ template<typename TBinaryStream>
+ inline std::shared_ptr<TBinaryStream> t_CreateCBinaryStream(std::string_view path,
+                                                             const char*      mode) {
+     struct Shared : public CBinaryStream<TBinaryStream> {
+         Shared(std::string_view path, std::FILE* file): CBinaryStream<TBinaryStream>(path, file) {};
+     };
+-    if (std::filesystem::is_directory(path)) {
+-        LOG_ERROR("can't open: \'%s\', which is a directory", path.data());
++    auto fs_path = Utf8ToFsPath(path);
++    if (std::filesystem::is_directory(fs_path)) {
++        LOG_ERROR("can't open: \'%s\', which is a directory", std::string(path).c_str());
+         return nullptr;
+     }
++#ifdef _WIN32
++    std::wstring wmode;
++    for (const char* p = mode; *p != '\0'; ++p) wmode.push_back(static_cast<wchar_t>(*p));
++    auto* file = _wfopen(fs_path.c_str(), wmode.c_str());
++#else
+     auto* file = std::fopen(std::string(path).c_str(), mode);
++#endif
+     if (file == NULL) {
+-        LOG_ERROR("can't open: %s", path.data());
++        LOG_ERROR("can't open: %s", std::string(path).c_str());
+         return nullptr;
+     }
+     auto cb = std::make_shared<Shared>(path, file);
+diff --git a/src/Fs/include/Fs/PhysicalFs.h b/src/Fs/include/Fs/PhysicalFs.h
+index 836bcea..b105497 100644
+--- a/src/Fs/include/Fs/PhysicalFs.h
++++ b/src/Fs/include/Fs/PhysicalFs.h
+@@ -12,38 +12,39 @@ namespace fs
+ 
+ class PhysicalFs : public Fs {
+ public:
+-    PhysicalFs(std::string_view physicalPath): m_path(physicalPath) {}
++    PhysicalFs(std::string_view physicalPath): m_path(Utf8ToFsPath(physicalPath)) {}
+     virtual ~PhysicalFs() = default;
+     bool Contains(std::string_view path) const override {
+-        auto fullpath = m_path / path.substr(1);
++        auto fullpath = m_path / Utf8ToFsPath(path.substr(1));
+         return std::filesystem::exists(fullpath);
+     }
+     std::shared_ptr<IBinaryStream> Open(std::string_view path) override {
+         return CreateCBinaryStream(FullPath(path));
+     }
+     std::shared_ptr<IBinaryStreamW> OpenW(std::string_view path) override {
+-        std::filesystem::path full_path { FullPath(path) };
++        auto full_path = m_path / Utf8ToFsPath(path.substr(1));
+         std::filesystem::create_directories(full_path.parent_path());
+-        return CreateCBinaryStreamW(full_path.native());
++        return CreateCBinaryStreamW(FsPathToUtf8(full_path));
+     }
+ 
+ private:
+     std::string FullPath(std::string_view path) const {
+-        auto fullpath = m_path / path.substr(1);
+-        return fullpath.string();
++        auto fullpath = m_path / Utf8ToFsPath(path.substr(1));
++        return FsPathToUtf8(fullpath);
+     }
+     std::filesystem::path m_path;
+ };
+ 
+ inline std::unique_ptr<PhysicalFs> CreatePhysicalFs(std::string_view path, bool create = false) {
+-    if (! std::filesystem::exists(path)) {
++    auto fs_path = Utf8ToFsPath(path);
++    if (! std::filesystem::exists(fs_path)) {
+         if (create) {
+-            if (! std::filesystem::create_directories(path)) {
+-                LOG_ERROR("mkdir \"%s\" failed", path.data());
++            if (! std::filesystem::create_directories(fs_path)) {
++                LOG_ERROR("mkdir \"%s\" failed", std::string(path).c_str());
+                 return nullptr;
+             }
+         } else {
+-            LOG_ERROR("\"%s\" not exists", path.data());
++            LOG_ERROR("\"%s\" not exists", std::string(path).c_str());
+             return nullptr;
+         }
+     }
+diff --git a/src/Interface/IParticleRawGener.h b/src/Interface/IParticleRawGener.h
+index 9719146..8d61539 100644
+--- a/src/Interface/IParticleRawGener.h
++++ b/src/Interface/IParticleRawGener.h
+@@ -10,6 +10,9 @@ namespace wallpaper
+ {
+ struct ParticleRawGenSpec {
+     float* lifetime;
++    float* alpha { nullptr };
++    float* size { nullptr };
++    float  pos_z { 0.0f };
+ };
+ using ParticleRawGenSpecOp = std::function<void(const Particle&, const ParticleRawGenSpec&)>;
+ 
+diff --git a/src/Particle/WPParticleRawGener.cpp b/src/Particle/WPParticleRawGener.cpp
+index 7087094..c3b5104 100644
+--- a/src/Particle/WPParticleRawGener.cpp
++++ b/src/Particle/WPParticleRawGener.cpp
+@@ -54,11 +54,14 @@ inline usize GenParticleData(std::span<const std::unique_ptr<ParticleInstance>>
+                 continue;
+             }
+ 
++            auto  pos      = inst->GetBoundedData().pos + p.position;
+             float lifetime = p.lifetime;
+-            specOp(p, { &lifetime });
+-
+-            auto  pos  = inst->GetBoundedData().pos + p.position;
+-            float size = p.size / 2.0f;
++            float alpha    = p.alpha;
++            float size     = p.size / 2.0f;
++            specOp(p, { &lifetime, &alpha, &size, pos[2] });
++            if (alpha <= 0.0f || size <= 0.0f) {
++                continue;
++            }
+ 
+             usize offset = 0;
+ 
+@@ -75,7 +78,7 @@ inline usize GenParticleData(std::span<const std::unique_ptr<ParticleInstance>>
+ 
+             // color
+             AssignVertexTimes({ data + offset, totle_size },
+-                              std::array { p.color[0], p.color[1], p.color[2], p.alpha },
++                              std::array { p.color[0], p.color[1], p.color[2], alpha },
+                               4);
+             offset += 4;
+ 
+@@ -141,15 +144,16 @@ inline size_t GenRopeParticleData(std::span<const Particle>   particles,
+         float in_ParticleTrailLength   = particles.size();
+         float in_ParticleTrailPosition = i - 1;
+ 
+-        Vector3f cp_vec = AngleAxisf(p.rotation[2] + M_PI / 2.0f, Vector3f::UnitZ()) *
+-                          Vector3f { 0.0f, size / 2.0f, 0.0f };
+-        Vector3f pos_vec = Vector3f { p.position } - Vector3f { pre_p.position };
++        Vector3f cp_vec = AngleAxisf(static_cast<float>(p.rotation[2] + M_PI / 2.0), Vector3f::UnitZ()) *
++                          Vector3f(0.0f, size / 2.0f, 0.0f);
++        Vector3f pos_vec = Vector3f(p.position[0], p.position[1], p.position[2]) -
++                           Vector3f(pre_p.position[0], pre_p.position[1], pre_p.position[2]);
+ 
+         cp_vec       = pos_vec.normalized().dot(cp_vec) > 0 ? cp_vec : -1.0f * cp_vec;
+         auto&    sp  = pre_p;
+         auto&    ep  = p;
+-        Vector3f scp = Vector3f { sp.position } + cp_vec;
+-        Vector3f ecp = Vector3f { ep.position } - cp_vec;
++        Vector3f scp = Vector3f(sp.position[0], sp.position[1], sp.position[2]) + cp_vec;
++        Vector3f ecp = Vector3f(ep.position[0], ep.position[1], ep.position[2]) - cp_vec;
+ 
+         // a_PositionVec4: start pos
+         AssignVertexTimes({ data + offset, totle_size },
+diff --git a/src/Utils/Algorism.cpp b/src/Utils/Algorism.cpp
+index 3156eb8..77aa190 100644
+--- a/src/Utils/Algorism.cpp
++++ b/src/Utils/Algorism.cpp
+@@ -1,5 +1,5 @@
+-#include "Algorism.h"
+-#include "Eigen.h"
++#include "Utils/Algorism.h"
++#include "Utils/Eigen.h"
+ 
+ using namespace wallpaper;
+ using namespace Eigen;
+diff --git a/src/Utils/DynamicLibrary.cpp b/src/Utils/DynamicLibrary.cpp
+index 2a5d933..30495b2 100644
+--- a/src/Utils/DynamicLibrary.cpp
++++ b/src/Utils/DynamicLibrary.cpp
+@@ -1,6 +1,13 @@
+-#include "DynamicLibrary.hpp"
++#include "Utils/DynamicLibrary.hpp"
+ 
+-#include "dlfcn.h"
++#ifdef _WIN32
++#    ifndef WIN32_LEAN_AND_MEAN
++#        define WIN32_LEAN_AND_MEAN
++#    endif
++#    include <windows.h>
++#else
++#    include "dlfcn.h"
++#endif
+ 
+ namespace utils
+ {
+@@ -21,7 +28,11 @@ DynamicLibrary& DynamicLibrary::operator=(DynamicLibrary&& o) noexcept {
+ }
+ 
+ bool DynamicLibrary::Open(const char* filename) {
++#ifdef _WIN32
++    handle = reinterpret_cast<void*>(LoadLibraryA(filename));
++#else
+     handle = dlopen(filename, RTLD_NOW);
++#endif
+     return IsOpen();
+ }
+ 
+@@ -29,13 +40,21 @@ bool DynamicLibrary::IsOpen() const { return handle != nullptr; }
+ 
+ void DynamicLibrary::Close() {
+     if (IsOpen()) {
++#ifdef _WIN32
++        FreeLibrary(reinterpret_cast<HMODULE>(handle));
++#else
+         dlclose(handle);
++#endif
+         handle = nullptr;
+     }
+ }
+ 
+ void* DynamicLibrary::GetSymbolAddr(const char* name) const {
++#ifdef _WIN32
++    return reinterpret_cast<void*>(GetProcAddress(reinterpret_cast<HMODULE>(handle), name));
++#else
+     return reinterpret_cast<void*>(dlsym(handle, name));
++#endif
+ }
+ 
+-}; // namespace wallpaper
++}; // namespace utils
+diff --git a/src/Utils/FpsCounter.cpp b/src/Utils/FpsCounter.cpp
+index 8baca97..30b92b8 100644
+--- a/src/Utils/FpsCounter.cpp
++++ b/src/Utils/FpsCounter.cpp
+@@ -1,4 +1,4 @@
+-#include "FpsCounter.h"
++#include "Utils/FpsCounter.h"
+ #include <iostream>
+ #include <chrono>
+ 
+diff --git a/src/Utils/FrameTimer.cpp b/src/Utils/FrameTimer.cpp
+index d0cbdee..875b789 100644
+--- a/src/Utils/FrameTimer.cpp
++++ b/src/Utils/FrameTimer.cpp
+@@ -1,4 +1,4 @@
+-#include "FrameTimer.h"
++#include "Utils/FrameTimer.h"
+ #include <iostream>
+ #include <cassert>
+ #include <algorithm>
+diff --git a/src/Utils/Logging.cpp b/src/Utils/Logging.cpp
+index a7be981..da0314a 100644
+--- a/src/Utils/Logging.cpp
++++ b/src/Utils/Logging.cpp
+@@ -1,9 +1,9 @@
+-#include "Logging.h"
++#include "Utils/Logging.h"
+ #include <cstdio>
+ #include <cstdarg>
+ #include <filesystem>
+ 
+-#include "Sha.hpp"
++#include "Utils/Sha.hpp"
+ 
+ constexpr const char* level_names[] = { "INFO", "ERROR" };
+ constexpr const char* level_fmt[]   = { "%-5s", "%-5s %s:%d " };
+@@ -24,14 +24,20 @@ std::string logToTmpfileWithSha1(std::span<const char> in, const char* fmt, ...)
+     std::va_list          args;
+     std::string           name   = utils::genSha1(in);
+     std::filesystem::path fspath = std::filesystem::temp_directory_path() / name;
+-    std::string           path   = fspath.native();
+-    auto*                 file   = std::fopen(path.c_str(), "w+");
+-    {
++#ifdef _WIN32
++    auto        u8   = fspath.u8string();
++    std::string path(reinterpret_cast<const char*>(u8.data()), u8.size());
++    auto*       file = _wfopen(fspath.c_str(), L"w+");
++#else
++    std::string path = fspath.native();
++    auto*       file = std::fopen(path.c_str(), "w+");
++#endif
++    if (file != nullptr) {
+         va_start(args, fmt);
+         std::vfprintf(file, fmt, args);
+         va_end(args);
++        std::fprintf(file, "\n");
++        std::fclose(file);
+     }
+-    std::fprintf(file, "\n");
+-    std::fclose(file);
+     return path;
+ }
+diff --git a/src/Utils/Sha.cpp b/src/Utils/Sha.cpp
+index 4c3fd91..8a1d12f 100644
+--- a/src/Utils/Sha.cpp
++++ b/src/Utils/Sha.cpp
+@@ -1,4 +1,4 @@
+-#include "Sha.hpp"
++#include "Utils/Sha.hpp"
+ #include <vog/sha1.hpp>
+ 
+ std::string utils::genSha1(std::span<const char> in) {
+diff --git a/src/Vulkan/GraphicsPipeline.cpp b/src/Vulkan/GraphicsPipeline.cpp
+index 5d4c905..a3f9a4f 100644
+--- a/src/Vulkan/GraphicsPipeline.cpp
++++ b/src/Vulkan/GraphicsPipeline.cpp
+@@ -154,6 +154,7 @@ GraphicsPipeline& GraphicsPipeline::setTopology(VkPrimitiveTopology topology) {
+ 
+ bool GraphicsPipeline::create(const Device& device, vvk::RenderPass& pass,
+                               PipelineParameters& pipeline) {
++    pipeline = {};
+     VkPipelineDynamicStateCreateInfo dynamic_info {
+         .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+         .pNext             = nullptr,
+diff --git a/src/Vulkan/Instance.cpp b/src/Vulkan/Instance.cpp
+index 3df0ea4..c03f2a5 100644
+--- a/src/Vulkan/Instance.cpp
++++ b/src/Vulkan/Instance.cpp
+@@ -23,7 +23,7 @@ VkBool32 DebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT
+     if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+         result |= VK_TRUE;
+ 
+-        std::printf("validation layer: %s\n", pCallbackData->pMessage);
++        std::fprintf(stderr, "validation layer: %s\n", pCallbackData->pMessage);
+     }
+     return result;
+ }
+diff --git a/src/Vulkan/Parameters.cpp b/src/Vulkan/Parameters.cpp
+index 4bdaedc..815ed6f 100644
+--- a/src/Vulkan/Parameters.cpp
++++ b/src/Vulkan/Parameters.cpp
+@@ -32,8 +32,15 @@ VmaImageParameters& VmaImageParameters::operator=(VmaImageParameters&& o) noexce
+     return *this;
+ }
+ 
+-ExImageParameters::ExImageParameters()  = default;
+-ExImageParameters::~ExImageParameters() = default;
++ExImageParameters::ExImageParameters() = default;
++ExImageParameters::~ExImageParameters() {
++#ifdef _WIN32
++    if (mapped_ptr != nullptr && staging_buf.handle) {
++        staging_buf.handle.UnMapMemory();
++        mapped_ptr = nullptr;
++    }
++#endif
++}
+ ExImageParameters::ExImageParameters(ExImageParameters&& o) noexcept
+     : mem(std::move(o.mem)),
+       mem_reqs(o.mem_reqs),
+@@ -42,8 +49,21 @@ ExImageParameters::ExImageParameters(ExImageParameters&& o) noexcept
+       sampler(std::move(o.sampler)),
+       extent(o.extent),
+       mipmap_level(o.mipmap_level),
+-      fd(std::exchange(o.fd, 0)) {}
++      fd(std::exchange(o.fd, 0))
++#ifdef _WIN32
++      ,
++      staging_buf(std::move(o.staging_buf)),
++      mapped_ptr(std::exchange(o.mapped_ptr, nullptr))
++#endif
++{
++}
+ ExImageParameters& ExImageParameters::operator=(ExImageParameters&& o) noexcept {
++#ifdef _WIN32
++    if (mapped_ptr != nullptr && staging_buf.handle) {
++        staging_buf.handle.UnMapMemory();
++        mapped_ptr = nullptr;
++    }
++#endif
+     mem          = std::move(o.mem);
+     mem_reqs     = o.mem_reqs;
+     handle       = std::move(o.handle);
+@@ -52,6 +72,10 @@ ExImageParameters& ExImageParameters::operator=(ExImageParameters&& o) noexcept
+     extent       = o.extent;
+     mipmap_level = o.mipmap_level;
+     fd           = std::exchange(o.fd, 0);
++#ifdef _WIN32
++    staging_buf = std::move(o.staging_buf);
++    mapped_ptr  = std::exchange(o.mapped_ptr, nullptr);
++#endif
+     return *this;
+ }
+ 
+diff --git a/src/Vulkan/Shader.cpp b/src/Vulkan/Shader.cpp
+index e91ed11..a283b4e 100644
+--- a/src/Vulkan/Shader.cpp
++++ b/src/Vulkan/Shader.cpp
+@@ -1,9 +1,8 @@
+ #include "Shader.hpp"
+ 
+ #include <cassert>
+-#include <glslang/Include/Types.h>
+-#include <glslang/MachineIndependent/localintermediate.h>
+-#include <glslang/MachineIndependent/iomapper.h>
++#include <glslang/Public/ShaderLang.h>
++#include <glslang/Public/ResourceLimits.h>
+ #include <glslang/SPIRV/GlslangToSpv.h>
+ #include "Spv.hpp"
+ #include "TextureCache.hpp"
+@@ -94,7 +93,7 @@ inline bool parse(const ShaderCompUnit& unit, const ShaderCompOpt& opt, EShMessa
+     auto  client = getClient(opt.client_ver);
+     shader.setStrings(&data, 1);
+     shader.setEnvInput(opt.hlsl ? glslang::EShSourceHlsl : glslang::EShSourceGlsl,
+-                       EShLanguage::EShLangVertex,
++                       unit.stage,
+                        client,
+                        ClientInputSemanticsVersion);
+     shader.setEnvClient(client, opt.client_ver);
+@@ -106,8 +105,8 @@ inline bool parse(const ShaderCompUnit& unit, const ShaderCompOpt& opt, EShMessa
+         shader.setEnvInputVulkanRulesRelaxed();
+     }
+     const int        default_ver = 110; // 100 for es, 110 for desktop
+-    TBuiltInResource resource    = DefaultTBuiltInResource;
+-    if (! shader.parse(&resource, default_ver, false, emsg)) {
++    const TBuiltInResource* resource = GetDefaultResources();
++    if (! shader.parse(resource, default_ver, false, emsg)) {
+         std::string tmp_name = logToTmpfileWithSha1(unit.src, "%s", unit.src.c_str());
+         LOG_INFO("--- shader compile failed ---");
+         LOG_ERROR("shader source is at %s", tmp_name.c_str());
+@@ -125,14 +124,6 @@ inline void SetMessageOptions(const ShaderCompOpt& opt, EShMessages& emsg) {
+     if (getClient(opt.client_ver) == glslang::EShClientVulkan)
+         emsg = (EShMessages)(emsg | EShMsgVulkanRules);
+ }
+-
+-inline i32 GetTypeNum(const glslang::TType* type) {
+-    i32 num { 1 };
+-    if (type->isArray()) num *= type->getCumulativeArraySize();
+-    if (type->isVector()) num *= type->getVectorSize();
+-    if (type->isMatrix()) num *= type->getMatrixCols() * type->getMatrixRows();
+-    return num;
+-}
+ } // namespace
+ const TBuiltInResource wallpaper::vulkan::DefaultTBuiltInResource {
+     .maxLights =  32,
+@@ -427,21 +418,14 @@ bool wallpaper::vulkan::CompileAndLinkShaderUnits(std::span<const ShaderCompUnit
+         return false;
+     }
+ 
+-    for (auto& unit : compUnits) {
+-        (void)program.getIntermediate(unit.stage);
+-    }
+-    glslang::TIntermediate*         firstIm = program.getIntermediate(compUnits[0].stage);
+-    glslang::TDefaultGlslIoResolver resolver(*firstIm);
+-    glslang::TGlslIoMapper          ioMapper;
+-
+-    if (! (program.mapIO(&resolver, &ioMapper))) {
++    if (! (program.mapIO())) {
+         LOG_ERROR("glslang(mapIo): %s\n", program.getInfoLog());
+         return false;
+     }
+ 
+     spv::SpvBuildLogger logger;
+     glslang::SpvOptions spvOptions;
+-    spvOptions.validate          = true;
++    spvOptions.validate          = false;
+     spvOptions.generateDebugInfo = false;
+ 
+     spvs.clear();
+@@ -449,7 +433,6 @@ bool wallpaper::vulkan::CompileAndLinkShaderUnits(std::span<const ShaderCompUnit
+         Uni_ShaderSpv spv = std::make_unique<ShaderSpv>();
+         spv->stage        = ::ToGeneType(::ToVkType(unit.stage));
+         auto im           = program.getIntermediate(unit.stage);
+-        im->setOriginUpperLeft();
+         glslang::GlslangToSpv(*im, spv->spirv, &logger, &spvOptions);
+         spvs.emplace_back(std::move(spv));
+ 
+@@ -459,27 +442,3 @@ bool wallpaper::vulkan::CompileAndLinkShaderUnits(std::span<const ShaderCompUnit
+ 
+     return true;
+ }
+-
+-VkFormat wallpaper::vulkan::ToVkType(glslang::TBasicType type, size_t size) {
+-#define FORMAT_SWITCH(in, s, sign, type)                       \
+-    switch (in) {                                              \
+-    case 1: return _VK_FORMAT_1(s, _##sign, type, R);          \
+-    case 2: return _VK_FORMAT_2(s, _##sign, type, R, G);       \
+-    case 3: return _VK_FORMAT_3(s, _##sign, type, R, G, B);    \
+-    case 4: return _VK_FORMAT_4(s, _##sign, type, R, G, B, A); \
+-    }                                                          \
+-    break;
+-
+-    switch (type) {
+-    case glslang::TBasicType::EbtFloat: FORMAT_SWITCH(size, 32, S, FLOAT);
+-    case glslang::TBasicType::EbtInt: FORMAT_SWITCH(size, 32, S, INT);
+-    case glslang::TBasicType::EbtUint: FORMAT_SWITCH(size, 32, U, INT);
+-    default: break;
+-    }
+-    LOG_ERROR("can't covert glslang type \"%s\" of size %d to vulkan format",
+-              glslang::TType::getBasicString(type),
+-              size);
+-    assert(false);
+-    return VK_FORMAT_UNDEFINED;
+-#undef FORMAT_SWITCH
+-}
+diff --git a/src/Vulkan/StagingBuffer.cpp b/src/Vulkan/StagingBuffer.cpp
+index 800df6a..ba56250 100644
+--- a/src/Vulkan/StagingBuffer.cpp
++++ b/src/Vulkan/StagingBuffer.cpp
+@@ -47,18 +47,22 @@ void RecordCopyBuffer(const BufferParameters& dst_buf, const BufferParameters& s
+     cmd.CopyBuffer(src_buf.handle, dst_buf.handle, copy);
+ 
+     VkBufferMemoryBarrier in_bar {
+-        .sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+-        .pNext         = nullptr,
+-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+-        .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT,
+-        .buffer        = dst_buf.handle,
+-        .offset        = 0,
+-        .size          = VK_WHOLE_SIZE,
++        .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
++        .pNext               = nullptr,
++        .srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
++        .dstAccessMask       = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
++                               VK_ACCESS_INDEX_READ_BIT |
++                               VK_ACCESS_UNIFORM_READ_BIT,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .buffer              = dst_buf.handle,
++        .offset              = 0,
++        .size                = VK_WHOLE_SIZE,
+     };
+     cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+-                        VK_DEPENDENCY_BY_REGION_BIT,
++                        0,
+                         in_bar);
+ }
+ } // namespace
+@@ -126,6 +130,7 @@ bool StagingBuffer::allocate() {
+ void StagingBuffer::destroy() {
+     if (m_stage_raw != nullptr) {
+         m_stage_buf.handle.UnMapMemory();
++        m_stage_raw = nullptr;
+     }
+     for (auto& block : m_virtual_blocks) {
+         if (block.enabled) {
+diff --git a/src/Vulkan/TextureCache.cpp b/src/Vulkan/TextureCache.cpp
+index 4f76e34..bf578cb 100644
+--- a/src/Vulkan/TextureCache.cpp
++++ b/src/Vulkan/TextureCache.cpp
+@@ -156,10 +156,12 @@ std::optional<vvk::DeviceMemory> AllocateMemory(const vvk::Device& device, vvk::
+ std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height, VkFormat format,
+                                                VkImageTiling       tiling,
+                                                VkSamplerCreateInfo sampler_info,
+-                                               VkImageUsageFlags usage, const vvk::Device& device,
+-                                               const vvk::PhysicalDevice& gpu) {
++                                               VkImageUsageFlags usage, const Device& dev) {
++    const auto& device = dev.device();
++    const auto& gpu    = dev.gpu();
+     ExImageParameters image;
+     do {
++#ifndef _WIN32
+         VkExternalMemoryImageCreateInfo ex_info {
+             .sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+             .pNext       = NULL,
+@@ -170,20 +172,25 @@ std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height,
+                                                  .pNext = NULL,
+                                                  .handleTypes =
+                                                      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
+-        VkImageCreateInfo          info {
+-                     .sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+-                     .pNext       = &ex_info,
+-                     .imageType   = VK_IMAGE_TYPE_2D,
+-                     .format      = format,
+-                     .extent      = VkExtent3D { .width = width, .height = height, .depth = 1 },
+-                     .mipLevels   = 1,
+-                     .arrayLayers = 1,
+-                     .samples     = VK_SAMPLE_COUNT_1_BIT,
+-                     .tiling      = tiling,
+-                     .usage       = usage,
+-                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+-                     .queueFamilyIndexCount = 0,
+-                     .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
++#endif
++        VkImageCreateInfo info {
++            .sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++#ifdef _WIN32
++            .pNext       = nullptr,
++#else
++            .pNext       = &ex_info,
++#endif
++            .imageType   = VK_IMAGE_TYPE_2D,
++            .format      = format,
++            .extent      = VkExtent3D { .width = width, .height = height, .depth = 1 },
++            .mipLevels   = 1,
++            .arrayLayers = 1,
++            .samples     = VK_SAMPLE_COUNT_1_BIT,
++            .tiling      = tiling,
++            .usage       = usage,
++            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++            .queueFamilyIndexCount = 0,
++            .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
+         };
+         image.extent = info.extent;
+ 
+@@ -191,8 +198,16 @@ std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height,
+ 
+         image.mem_reqs = device.GetImageMemoryRequirements(*image.handle);
+ 
+-        if (auto opt = AllocateMemory(
+-                device, gpu, image.mem_reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ex_mem_info);
++        if (auto opt = AllocateMemory(device,
++                                      gpu,
++                                      image.mem_reqs,
++                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++#ifdef _WIN32
++                                      nullptr
++#else
++                                      &ex_mem_info
++#endif
++            );
+             opt.has_value()) {
+             image.mem = std::move(opt.value());
+         } else
+@@ -218,7 +233,27 @@ std::optional<ExImageParameters> CreateExImage(uint32_t width, uint32_t height,
+             VVK_CHECK_ACT(break, device.CreateImageView(createinfo, image.view));
+         }
+         VVK_CHECK_ACT(break, device.CreateSampler(sampler_info, image.sampler));
++#ifdef _WIN32
++        {
++            const std::size_t buf_size = static_cast<std::size_t>(width) * height * 4u;
++            VkBufferCreateInfo bci {
++                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++                .pNext = nullptr,
++                .size  = buf_size,
++                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++            };
++            image.staging_buf.req_size = buf_size;
++            VmaAllocationCreateInfo vma_info = {};
++            vma_info.usage         = VMA_MEMORY_USAGE_GPU_TO_CPU;
++            vma_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++            VVK_CHECK_ACT(break,
++                          vvk::CreateBuffer(dev.vma_allocator(), bci, vma_info, image.staging_buf.handle));
++            VVK_CHECK_ACT(break, image.staging_buf.handle.MapMemory(&image.mapped_ptr));
++        }
++#else
+         VVK_CHECK_ACT(break, image.mem.GetMemoryFdKHR(&image.fd));
++#endif
+ 
+         return image;
+ 
+@@ -404,14 +439,20 @@ std::optional<ExImageParameters> TextureCache::CreateExTex(uint32_t width, uint3
+                              tiling,
+                              sampler_info,
+                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+-                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+-                             m_device.device(),
+-                             m_device.gpu());
++                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                             m_device);
+     if (opt.has_value()) {
+         const auto& eximg = opt.value();
+ 
+         if (! m_tex_cmd) allocateCmd();
++#ifdef _WIN32
++        TransImgLayout(m_device.graphics_queue().handle,
++                       m_tex_cmd,
++                       eximg,
++                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++#else
+         TransImgLayout(m_device.graphics_queue().handle, m_tex_cmd, eximg, VK_IMAGE_LAYOUT_GENERAL);
++#endif
+         VVK_CHECK(m_device.handle().WaitIdle());
+     }
+     return opt;
+@@ -630,21 +671,26 @@ void TextureCache::RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParame
+                                                        : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+ 
+         barrier.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+-        barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
++        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                                VK_ACCESS_SHADER_READ_BIT;
+         barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+ 
+-        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
++        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT |
++                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                            VK_DEPENDENCY_BY_REGION_BIT,
++                            0,
+                             barrier);
+ 
+         barrier.subresourceRange.baseMipLevel = i;
+-        barrier.oldLayout                     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++        barrier.oldLayout                     = VK_IMAGE_LAYOUT_UNDEFINED;
+         barrier.newLayout                     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        barrier.srcAccessMask                 = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++        barrier.dstAccessMask                 = VK_ACCESS_TRANSFER_WRITE_BIT;
+ 
+-        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
++        cmd.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                            VK_DEPENDENCY_BY_REGION_BIT,
++                            0,
+                             barrier);
+ 
+         VkImageBlit blit {
+diff --git a/src/Vulkan/include/Vulkan/Parameters.hpp b/src/Vulkan/include/Vulkan/Parameters.hpp
+index 1ae1b80..6e87913 100644
+--- a/src/Vulkan/include/Vulkan/Parameters.hpp
++++ b/src/Vulkan/include/Vulkan/Parameters.hpp
+@@ -58,6 +58,10 @@ struct ExImageParameters : NoCopy {
+     VkExtent3D     extent;
+     uint           mipmap_level { 1 };
+     int            fd { 0 };
++#ifdef _WIN32
++    VmaBufferParameters staging_buf;
++    void*               mapped_ptr { nullptr };
++#endif
+ 
+     ExImageParameters();
+     ~ExImageParameters();
+diff --git a/src/Vulkan/include/Vulkan/Shader.hpp b/src/Vulkan/include/Vulkan/Shader.hpp
+index 7c8b385..b4b10de 100644
+--- a/src/Vulkan/include/Vulkan/Shader.hpp
++++ b/src/Vulkan/include/Vulkan/Shader.hpp
+@@ -1,15 +1,12 @@
+ #pragma once
+ #include "Instance.hpp"
+ #include "ShaderComp.hpp"
+-#include <glslang/Include/BaseTypes.h>
+ 
+ namespace wallpaper
+ {
+ namespace vulkan
+ {
+ 
+-VkFormat ToVkType(glslang::TBasicType, size_t);
+-
+ struct ShaderReflected {
+     struct BlockedUniform {
+         int    block_index;
+diff --git a/src/Vulkan/include/Vulkan/VulkanExSwapchain.hpp b/src/Vulkan/include/Vulkan/VulkanExSwapchain.hpp
+index 4c4336e..6252d76 100644
+--- a/src/Vulkan/include/Vulkan/VulkanExSwapchain.hpp
++++ b/src/Vulkan/include/Vulkan/VulkanExSwapchain.hpp
+@@ -57,7 +57,11 @@ public:
+         return m_handles.at((usize)(*inprogress()).id()).image;
+     }
+ 
++#ifdef _WIN32
++    constexpr VkFormat format() const { return VK_FORMAT_B8G8R8A8_UNORM; };
++#else
+     constexpr VkFormat format() const { return VK_FORMAT_R8G8B8A8_UNORM; };
++#endif
+ 
+ protected:
+     atomic_& presented() override { return m_presented; };
+@@ -74,9 +78,14 @@ private:
+ 
+ inline std::unique_ptr<VulkanExSwapchain> CreateExSwapchain(const Device& device, uint w, uint h,
+                                                             VkImageTiling tiling) {
++#ifdef _WIN32
++    constexpr VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
++#else
++    constexpr VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
++#endif
+     std::array<VulkanExHandle, 3> handles;
+     for (auto& handle : handles) {
+-        if (auto rv = device.tex_cache().CreateExTex(w, h, VK_FORMAT_R8G8B8A8_UNORM, tiling);
++        if (auto rv = device.tex_cache().CreateExTex(w, h, fmt, tiling);
+             rv.has_value())
+             handle.image = std::move(rv.value());
+         else
+diff --git a/src/Vulkan/vulkan_wrapper.cpp b/src/Vulkan/vulkan_wrapper.cpp
+index 338a549..72a7f11 100644
+--- a/src/Vulkan/vulkan_wrapper.cpp
++++ b/src/Vulkan/vulkan_wrapper.cpp
+@@ -28,8 +28,12 @@ bool Load(InstanceDispatch& dld) noexcept {
+ 
+ VkResult LoadLibrary(utils::DynamicLibrary& dlib, vvk::InstanceDispatch& dld) {
+     using namespace utils;
++#ifdef _WIN32
++    dlib = DynamicLibrary("vulkan-1.dll");
++#else
+     dlib = DynamicLibrary("libvulkan.so.1");
+     if (! dlib.IsOpen()) dlib = DynamicLibrary("libvulkan.so");
++#endif
+     if (! dlib.IsOpen()) return VK_ERROR_INITIALIZATION_FAILED;
+ 
+     if (! dlib.GetSymbol("vkGetInstanceProcAddr", dld.vkGetInstanceProcAddr))
+diff --git a/src/VulkanRender/CopyPass.cpp b/src/VulkanRender/CopyPass.cpp
+index ab7e975..df43239 100644
+--- a/src/VulkanRender/CopyPass.cpp
++++ b/src/VulkanRender/CopyPass.cpp
+@@ -86,29 +86,40 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
+     };
+     {
+         VkImageMemoryBarrier in_bar {
+-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+-            .pNext            = nullptr,
+-            .srcAccessMask    = VK_ACCESS_MEMORY_READ_BIT,
+-            .dstAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
+-            .oldLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+-            .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-            .image            = src.handle,
+-            .subresourceRange = srang,
++            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext               = nullptr,
++            .srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                                   VK_ACCESS_TRANSFER_WRITE_BIT |
++                                   VK_ACCESS_SHADER_READ_BIT,
++            .dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
++            .oldLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++            .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image               = src.handle,
++            .subresourceRange    = srang,
+         };
+         VkImageMemoryBarrier out_bar {
+-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+-            .pNext            = nullptr,
+-            .srcAccessMask    = VK_ACCESS_MEMORY_READ_BIT,
+-            .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+-            .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+-            .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+-            .image            = dst.handle,
+-            .subresourceRange = srang,
++            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext               = nullptr,
++            .srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                                   VK_ACCESS_SHADER_READ_BIT |
++                                   VK_ACCESS_TRANSFER_READ_BIT |
++                                   VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
++            .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image               = dst.handle,
++            .subresourceRange    = srang,
+         };
+ 
+-        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++        cmd.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                            VK_DEPENDENCY_BY_REGION_BIT,
++                            0,
+                             {},
+                             {},
+                             std::array { in_bar, out_bar });
+@@ -120,29 +131,40 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
+                   copy);
+     {
+         VkImageMemoryBarrier in_bar {
+-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+-            .pNext            = nullptr,
+-            .srcAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
+-            .dstAccessMask    = VK_ACCESS_MEMORY_READ_BIT,
+-            .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-            .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+-            .image            = src.handle,
+-            .subresourceRange = srang,
++            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext               = nullptr,
++            .srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
++            .dstAccessMask       = VK_ACCESS_SHADER_READ_BIT |
++                                   VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++            .oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++            .newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image               = src.handle,
++            .subresourceRange    = srang,
+         };
+         VkImageMemoryBarrier out_bar {
+-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+-            .pNext            = nullptr,
+-            .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+-            .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+-            .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+-            .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+-            .image            = dst.handle,
+-            .subresourceRange = srang,
++            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext               = nullptr,
++            .srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask       = VK_ACCESS_SHADER_READ_BIT |
++                                   VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                                   VK_ACCESS_TRANSFER_READ_BIT,
++            .oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image               = dst.handle,
++            .subresourceRange    = srang,
+         };
+ 
+         cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+-                            VK_DEPENDENCY_BY_REGION_BIT,
++                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                                VK_PIPELINE_STAGE_TRANSFER_BIT,
++                            0,
+                             {},
+                             {},
+                             std::array { in_bar, out_bar });
+@@ -152,4 +174,7 @@ void CopyPass::execute(const Device& device, RenderingResources& rr) {
+         device.tex_cache().RecGenerateMipmaps(cmd, dst);
+     }
+ };
+-void CopyPass::destory(const Device&, RenderingResources&) {}
++void CopyPass::destory(const Device&, RenderingResources&) {
++    setPrepared(false);
++    clearReleaseTexs();
++}
+diff --git a/src/VulkanRender/CustomShaderPass.cpp b/src/VulkanRender/CustomShaderPass.cpp
+index 9b6acf1..eb890e7 100644
+--- a/src/VulkanRender/CustomShaderPass.cpp
++++ b/src/VulkanRender/CustomShaderPass.cpp
+@@ -53,13 +53,37 @@ std::optional<vvk::RenderPass> CreateRenderPass(const vvk::Device& device, VkFor
+         .pColorAttachments    = &attachment_ref,
+     };
+ 
+-    VkSubpassDependency dependency {
+-        .srcSubpass    = VK_SUBPASS_EXTERNAL,
+-        .dstSubpass    = 0,
+-        .srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+-        .dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+-        .srcAccessMask = {},
+-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++    std::array<VkSubpassDependency, 2> dependencies {
++        VkSubpassDependency {
++            .srcSubpass      = VK_SUBPASS_EXTERNAL,
++            .dstSubpass      = 0,
++            .srcStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                               VK_PIPELINE_STAGE_TRANSFER_BIT,
++            .dstStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++            .srcAccessMask   = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                               VK_ACCESS_TRANSFER_WRITE_BIT |
++                               VK_ACCESS_SHADER_READ_BIT,
++            .dstAccessMask   = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                               VK_ACCESS_SHADER_READ_BIT,
++            .dependencyFlags = 0,
++        },
++        VkSubpassDependency {
++            .srcSubpass      = 0,
++            .dstSubpass      = VK_SUBPASS_EXTERNAL,
++            .srcStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++            .dstStageMask    = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                               VK_PIPELINE_STAGE_TRANSFER_BIT,
++            .srcAccessMask   = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++            .dstAccessMask   = VK_ACCESS_SHADER_READ_BIT |
++                               VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                               VK_ACCESS_TRANSFER_READ_BIT,
++            .dependencyFlags = 0,
++        },
+     };
+ 
+     VkRenderPassCreateInfo creatinfo {
+@@ -68,8 +92,8 @@ std::optional<vvk::RenderPass> CreateRenderPass(const vvk::Device& device, VkFor
+         .pAttachments    = &attachment,
+         .subpassCount    = 1,
+         .pSubpasses      = &subpass,
+-        .dependencyCount = 1,
+-        .pDependencies   = &dependency,
++        .dependencyCount = static_cast<uint32_t>(dependencies.size()),
++        .pDependencies   = dependencies.data(),
+     };
+     vvk::RenderPass pass;
+     if (auto res = device.CreateRenderPass(creatinfo, pass); res == VK_SUCCESS) {
+@@ -215,6 +239,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
+                         return;
+                 } else {
+                     if (! rr.dyn_buf->allocateSubRef(vertex.CapacitySizeOf(), buf)) return;
++                    rr.dyn_buf->fillBuf(buf, 0, buf.size, 0);
+                 }
+             }
+             m_desc.draw_count += (u32)(vertex.DataSize() / vertex.OneSize());
+@@ -223,13 +248,14 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
+         if (mesh.IndexCount() > 0) {
+             auto&  indice     = mesh.GetIndexArray(0);
+             size_t count      = (indice.DataCount() * 2) / 3;
+-            m_desc.draw_count = (u32)count * 3;
++            m_desc.draw_count = m_desc.dyn_vertex ? 0u : (u32)count * 3;
+             auto& buf         = m_desc.index_buf;
+             if (! m_desc.dyn_vertex) {
+                 if (! rr.vertex_buf->allocateSubRef(indice.CapacitySizeof(), buf)) return;
+                 if (! rr.vertex_buf->writeToBuf(buf, { (uint8_t*)indice.Data(), buf.size })) return;
+             } else {
+                 if (! rr.dyn_buf->allocateSubRef(indice.CapacitySizeof(), buf)) return;
++                rr.dyn_buf->fillBuf(buf, 0, buf.size, 0);
+             }
+         }
+     }
+@@ -388,17 +414,19 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
+     setPrepared();
+ }
+ 
+-void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
++void CustomShaderPass::update(const Device&, RenderingResources&) {
+     if (m_desc.update_op) m_desc.update_op();
++}
+ 
++void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
+     auto&                   cmd    = rr.command;
+     auto&                   outext = m_desc.vk_output.extent;
+     VkImageSubresourceRange base_srang {
+         .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+         .baseMipLevel   = 0,
+-        .levelCount     = VK_REMAINING_ARRAY_LAYERS,
++        .levelCount     = VK_REMAINING_MIP_LEVELS,
+         .baseArrayLayer = 0,
+-        .layerCount     = VK_REMAINING_MIP_LEVELS,
++        .layerCount     = VK_REMAINING_ARRAY_LAYERS,
+     };
+     for (usize i = 0; i < m_desc.vk_textures.size(); i++) {
+         auto& slot    = m_desc.vk_textures[i];
+@@ -421,19 +449,22 @@ void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
+         cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.layout, 0, wset);
+ 
+         VkImageMemoryBarrier imb {
+-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+-            .pNext            = nullptr,
+-            .srcAccessMask    = VK_ACCESS_MEMORY_READ_BIT,
+-            .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+-            .oldLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+-            .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+-            .image            = img.handle,
+-            .subresourceRange = base_srang,
++            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext               = nullptr,
++            .srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask       = VK_ACCESS_SHADER_READ_BIT,
++            .oldLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++            .newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image               = img.handle,
++            .subresourceRange    = base_srang,
+         };
+ 
+-        cmd.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++        cmd.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+-                            VK_DEPENDENCY_BY_REGION_BIT,
++                            0,
+                             imb);
+     }
+ 
+@@ -490,25 +521,41 @@ void CustomShaderPass::execute(const Device&, RenderingResources& rr) {
+         auto& buf = m_desc.vertex_bufs[i];
+         cmd.BindVertexBuffers((u32)i, 1, &gpu_buf, &buf.offset);
+     }
+-    if (m_desc.index_buf) {
+-        cmd.BindIndexBuffer(gpu_buf, m_desc.index_buf.offset, VK_INDEX_TYPE_UINT16);
+-        cmd.DrawIndexed(m_desc.draw_count, 1, 0, 0, 0);
+-    } else {
+-        cmd.Draw(m_desc.draw_count, 1, 0, 0);
++    if (m_desc.draw_count > 0) {
++        if (m_desc.index_buf) {
++            cmd.BindIndexBuffer(gpu_buf, m_desc.index_buf.offset, VK_INDEX_TYPE_UINT16);
++            cmd.DrawIndexed(m_desc.draw_count, 1, 0, 0, 0);
++        } else {
++            cmd.Draw(m_desc.draw_count, 1, 0, 0);
++        }
+     }
+ 
+     cmd.EndRenderPass();
+ }
+ 
+ void CustomShaderPass::destory(const Device&, RenderingResources& rr) {
++    setPrepared(false);
++    clearReleaseTexs();
+     m_desc.update_op = {};
++    m_desc.fb        = {};
++    m_desc.pipeline  = {};
++    m_desc.vk_textures.clear();
++    m_desc.vk_tex_binding.clear();
+     {
+         auto& buf = m_desc.dyn_vertex ? rr.dyn_buf : rr.vertex_buf;
+         for (auto& bufref : m_desc.vertex_bufs) {
+-            buf->unallocateSubRef(bufref);
++            if (bufref) buf->unallocateSubRef(bufref);
++        }
++        m_desc.vertex_bufs.clear();
++        if (m_desc.index_buf) {
++            buf->unallocateSubRef(m_desc.index_buf);
++            m_desc.index_buf = {};
+         }
+     }
+-    rr.dyn_buf->unallocateSubRef(m_desc.ubo_buf);
++    if (m_desc.ubo_buf) {
++        rr.dyn_buf->unallocateSubRef(m_desc.ubo_buf);
++        m_desc.ubo_buf = {};
++    }
+ }
+ 
+ void CustomShaderPass::setDescTex(u32 index, std::string_view tex_key) {
+diff --git a/src/VulkanRender/CustomShaderPass.hpp b/src/VulkanRender/CustomShaderPass.hpp
+index 56abdf5..752ece2 100644
+--- a/src/VulkanRender/CustomShaderPass.hpp
++++ b/src/VulkanRender/CustomShaderPass.hpp
+@@ -54,6 +54,7 @@ public:
+     void setDescTex(u32 index, std::string_view tex_key);
+ 
+     void prepare(Scene&, const Device&, RenderingResources&) override;
++    void update(const Device&, RenderingResources&) override;
+     void execute(const Device&, RenderingResources&) override;
+     void destory(const Device&, RenderingResources&) override;
+ 
+diff --git a/src/VulkanRender/FinPass.cpp b/src/VulkanRender/FinPass.cpp
+index 3c38c90..aba1238 100644
+--- a/src/VulkanRender/FinPass.cpp
++++ b/src/VulkanRender/FinPass.cpp
+@@ -26,7 +26,7 @@ layout(binding = 1) uniform sampler2D u_Texture;
+ 
+ void main()
+ {
+-	out_FragColor = texture(u_Texture, v_Texcoord);
++	out_FragColor = vec4(texture(u_Texture, v_Texcoord).rgb, 1.0);
+ }
+ )";
+ 
+@@ -69,12 +69,28 @@ std::optional<vvk::RenderPass> CreateRenderPass(const vvk::Device& device, VkFor
+         .pColorAttachments    = &attachment_ref,
+     };
+ 
++    VkSubpassDependency dependency {
++        .srcSubpass      = VK_SUBPASS_EXTERNAL,
++        .dstSubpass      = 0,
++        .srcStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                           VK_PIPELINE_STAGE_TRANSFER_BIT,
++        .dstStageMask    = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++        .srcAccessMask   = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                           VK_ACCESS_TRANSFER_WRITE_BIT,
++        .dstAccessMask   = VK_ACCESS_SHADER_READ_BIT |
++                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++        .dependencyFlags = 0,
++    };
++
+     VkRenderPassCreateInfo creatinfo {
+         .sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+         .attachmentCount = 1,
+         .pAttachments    = &attachment,
+         .subpassCount    = 1,
+         .pSubpasses      = &subpass,
++        .dependencyCount = 1,
++        .pDependencies   = &dependency,
+     };
+     vvk::RenderPass pass;
+     if (auto res = device.CreateRenderPass(creatinfo, pass); res == VK_SUCCESS) {
+@@ -302,5 +318,10 @@ void FinPass::execute(const Device& device, RenderingResources& rr) {
+ void FinPass::destory(const Device&, RenderingResources& rr) {
+     setPrepared(false);
+     clearReleaseTexs();
+-    rr.vertex_buf->unallocateSubRef(m_desc.vertex_buf);
++    m_desc.fb       = {};
++    m_desc.pipeline = {};
++    if (m_desc.vertex_buf) {
++        rr.vertex_buf->unallocateSubRef(m_desc.vertex_buf);
++        m_desc.vertex_buf = {};
++    }
+ }
+diff --git a/src/VulkanRender/PassCommon.hpp b/src/VulkanRender/PassCommon.hpp
+index 0d2917a..a8aa7d0 100644
+--- a/src/VulkanRender/PassCommon.hpp
++++ b/src/VulkanRender/PassCommon.hpp
+@@ -35,12 +35,8 @@ inline void SetBlend(BlendMode bm, VkPipelineColorBlendAttachmentState& state) {
+     }
+ }
+ inline void SetAttachmentLoadOp(BlendMode bm, VkAttachmentLoadOp& load_op) {
+-    switch (bm) {
+-    case BlendMode::Disable:
+-    case BlendMode::Normal: load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE; break;
+-    case BlendMode::Additive:
+-    case BlendMode::Translucent: load_op = VK_ATTACHMENT_LOAD_OP_LOAD; break;
+-    }
++    (void)bm;
++    load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+ }
+ 
+ inline TextureKey ToTexKey(wallpaper::SceneRenderTarget rt) {
+diff --git a/src/VulkanRender/PrePass.cpp b/src/VulkanRender/PrePass.cpp
+index 238f7a7..15df76a 100644
+--- a/src/VulkanRender/PrePass.cpp
++++ b/src/VulkanRender/PrePass.cpp
+@@ -43,26 +43,32 @@ void PrePass::execute(const Device&, RenderingResources& rr) {
+     VkImageSubresourceRange base_srang {
+         .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+         .baseMipLevel   = 0,
+-        .levelCount     = VK_REMAINING_ARRAY_LAYERS,
++        .levelCount     = VK_REMAINING_MIP_LEVELS,
+         .baseArrayLayer = 0,
+-        .layerCount     = VK_REMAINING_MIP_LEVELS,
+-
++        .layerCount     = VK_REMAINING_ARRAY_LAYERS,
+     };
+     {
+         VkImageMemoryBarrier imb {
+-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+-            .pNext            = nullptr,
+-            .srcAccessMask    = VK_ACCESS_MEMORY_READ_BIT,
+-            .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+-            .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+-            .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+-            .image            = m_desc.vk_result.handle,
+-            .subresourceRange = base_srang,
++            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext               = nullptr,
++            .srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                                   VK_ACCESS_SHADER_READ_BIT |
++                                   VK_ACCESS_TRANSFER_READ_BIT |
++                                   VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
++            .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image               = m_desc.vk_result.handle,
++            .subresourceRange    = base_srang,
+         };
+ 
+-        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++        cmd.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                            VK_DEPENDENCY_BY_REGION_BIT,
++                            0,
+                             imb);
+     }
+     cmd.ClearColorImage(m_desc.vk_result.handle,
+@@ -70,19 +76,26 @@ void PrePass::execute(const Device&, RenderingResources& rr) {
+                         &m_desc.clear_value.color,
+                         base_srang);
+     VkImageMemoryBarrier imb {
+-        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+-        .pNext            = nullptr,
+-        .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+-        .dstAccessMask    = VK_ACCESS_MEMORY_READ_BIT,
+-        .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+-        .newLayout        = m_desc.layout,
+-        .image            = m_desc.vk_result.handle,
+-        .subresourceRange = base_srang,
++        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .pNext               = nullptr,
++        .srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
++        .dstAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                               VK_ACCESS_SHADER_READ_BIT |
++                               VK_ACCESS_TRANSFER_READ_BIT,
++        .oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++        .newLayout           = m_desc.layout,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .image               = m_desc.vk_result.handle,
++        .subresourceRange    = base_srang,
+     };
+ 
+     cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+-                        VK_DEPENDENCY_BY_REGION_BIT,
++                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                            VK_PIPELINE_STAGE_TRANSFER_BIT,
++                        0,
+                         imb);
+ }
+ void PrePass::destory(const Device&, RenderingResources&) {
+diff --git a/src/VulkanRender/VulkanPass.hpp b/src/VulkanRender/VulkanPass.hpp
+index 6e5458b..f5c53f2 100644
+--- a/src/VulkanRender/VulkanPass.hpp
++++ b/src/VulkanRender/VulkanPass.hpp
+@@ -23,6 +23,7 @@ public:
+     VulkanPass()                                                     = default;
+     virtual ~VulkanPass()                                            = default;
+     virtual void prepare(Scene&, const Device&, RenderingResources&) = 0;
++    virtual void update(const Device&, RenderingResources&) {}
+     virtual void execute(const Device&, RenderingResources&)         = 0;
+     virtual void destory(const Device&, RenderingResources&)         = 0;
+ 
+diff --git a/src/VulkanRender/VulkanRender.cpp b/src/VulkanRender/VulkanRender.cpp
+index 9fb7776..ee275f4 100644
+--- a/src/VulkanRender/VulkanRender.cpp
++++ b/src/VulkanRender/VulkanRender.cpp
+@@ -37,6 +37,12 @@ constexpr uint32_t vk_command_num { 2 };
+ constexpr std::array base_inst_exts {
+     Extension { false, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME },
+ };
++#ifdef _WIN32
++constexpr std::array base_device_exts {
++    Extension { false, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME },
++    Extension { true, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME },
++};
++#else
+ constexpr std::array base_device_exts {
+     Extension { false, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME },
+     Extension { true, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME },
+@@ -45,6 +51,7 @@ constexpr std::array base_device_exts {
+     Extension { true, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME },
+     Extension { true, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME }
+ };
++#endif
+ 
+ struct VulkanRender::Impl {
+     Impl()  = default;
+@@ -61,6 +68,7 @@ struct VulkanRender::Impl {
+     void clearLastRenderGraph();
+     void compileRenderGraph(Scene&, rg::RenderGraph&);
+     void UpdateCameraFillMode(Scene&, wallpaper::FillMode);
++    bool resizeOffscreen(uint32_t width, uint32_t height);
+ 
+     bool initRes();
+     void drawFrameSwapchain();
+@@ -75,6 +83,7 @@ struct VulkanRender::Impl {
+ 
+     std::unique_ptr<FinPass> m_testpass { nullptr };
+     ReDrawCB                 m_redraw_cb;
++    FrameCallback            m_frame_cb;
+ 
+     std::unique_ptr<StagingBuffer> m_vertex_buf { nullptr };
+     std::unique_ptr<StagingBuffer> m_dyn_buf { nullptr };
+@@ -108,6 +117,12 @@ void VulkanRender::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
+ void VulkanRender::UpdateCameraFillMode(Scene& scene, wallpaper::FillMode fill) {
+     pImpl->UpdateCameraFillMode(scene, fill);
+ };
++bool VulkanRender::resizeOffscreen(uint32_t width, uint32_t height) {
++    return pImpl->resizeOffscreen(width, height);
++}
++void VulkanRender::setFrameCallback(FrameCallback cb) {
++    pImpl->m_frame_cb = std::move(cb);
++}
+ 
+ wallpaper::ExSwapchain* VulkanRender::exSwapchain() const { return pImpl->m_ex_swapchain.get(); };
+ 
+@@ -116,11 +131,7 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
+ 
+     m_redraw_cb = info.redraw_callback;
+     VkExtent2D extent { info.width, info.height };
+-    if (extent.width * extent.height < 500 * 500) {
+-        LOG_ERROR("too small swapchain image size: %dx%d", extent.width, extent.height);
+-    } else {
+-        LOG_INFO("set swapchain image size: %dx%d", extent.width, extent.height);
+-    }
++    LOG_INFO("set swapchain image size: %dx%d", extent.width, extent.height);
+ 
+     std::vector<Extension> inst_exts { base_inst_exts.begin(), base_inst_exts.end() };
+     std::vector<Extension> device_exts { base_device_exts.begin(), base_device_exts.end() };
+@@ -199,8 +210,13 @@ bool VulkanRender::Impl::initRes() {
+         m_finpass->setPresentLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+     } else {
+         m_finpass->setPresentFormat(m_ex_swapchain->format());
++#ifdef _WIN32
++        m_finpass->setPresentLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        m_finpass->setPresentQueueIndex(m_device->graphics_queue().family_index);
++#else
+         m_finpass->setPresentLayout(VK_IMAGE_LAYOUT_GENERAL);
+         m_finpass->setPresentQueueIndex(VK_QUEUE_FAMILY_EXTERNAL);
++#endif
+     }
+     /*
+     m_testpass = std::make_unique<FinPass>(FinPass::Desc{});
+@@ -243,12 +259,28 @@ void VulkanRender::Impl::destroy() {
+         for (auto& p : m_passes) {
+             p->destory(*m_device, m_rendering_resources);
+         }
+-        m_vertex_buf->destroy();
+-        m_dyn_buf->destroy();
++        m_passes.clear();
++        m_prepass.reset();
++        m_finpass.reset();
++        m_testpass.reset();
++        m_ex_swapchain.reset();
++        m_device->tex_cache().Clear();
++        if (m_vertex_buf) {
++            m_vertex_buf->destroy();
++            m_vertex_buf.reset();
++        }
++        if (m_dyn_buf) {
++            m_dyn_buf->destroy();
++            m_dyn_buf.reset();
++        }
++        m_rendering_resources = {};
++        m_cmds = {};
+ 
+         m_device->Destroy();
+     }
++    m_device.reset();
+     m_instance.Destroy();
++    m_inited = false;
+ }
+ 
+ bool VulkanRender::Impl::CreateRenderingResource(RenderingResources& rr) {
+@@ -365,7 +397,8 @@ void VulkanRender::Impl::drawFrameSwapchain() {
+ }
+ void VulkanRender::Impl::drawFrameOffscreen() {
+     RenderingResources& rr    = m_rendering_resources;
+-    ImageParameters     image = m_ex_swapchain->GetInprogressImage();
++    ExImageParameters&  eximg = m_ex_swapchain->GetInprogressImage();
++    ImageParameters     image = eximg;
+ 
+     m_finpass->setPresent(image);
+ 
+@@ -374,6 +407,11 @@ void VulkanRender::Impl::drawFrameOffscreen() {
+         .pNext = nullptr,
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+     });
++    for (auto* p : m_passes) {
++        if (p->prepared()) {
++            p->update(*m_device, rr);
++        }
++    }
+     m_dyn_buf->recordUpload(rr.command);
+ 
+     for (auto* p : m_passes) {
+@@ -382,6 +420,53 @@ void VulkanRender::Impl::drawFrameOffscreen() {
+         }
+     }
+ 
++#ifdef _WIN32
++    {
++        VkImageMemoryBarrier copy_bar {
++            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext               = nullptr,
++            .srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++            .dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
++            .oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++            .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image               = *eximg.handle,
++            .subresourceRange =
++                VkImageSubresourceRange {
++                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
++                    .baseMipLevel   = 0,
++                    .levelCount     = 1,
++                    .baseArrayLayer = 0,
++                    .layerCount     = 1,
++                },
++        };
++        rr.command.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                   0,
++                                   copy_bar);
++
++        VkBufferImageCopy region {
++            .bufferOffset      = 0,
++            .bufferRowLength   = 0,
++            .bufferImageHeight = 0,
++            .imageSubresource =
++                VkImageSubresourceLayers {
++                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
++                    .mipLevel       = 0,
++                    .baseArrayLayer = 0,
++                    .layerCount     = 1,
++                },
++            .imageOffset = { 0, 0, 0 },
++            .imageExtent = eximg.extent,
++        };
++        rr.command.CopyImageToBuffer(*eximg.handle,
++                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                     *eximg.staging_buf.handle,
++                                     region);
++    }
++#endif
++
+     (void)rr.command.End();
+ 
+     VkSubmitInfo sub_info {
+@@ -395,6 +480,32 @@ void VulkanRender::Impl::drawFrameOffscreen() {
+     VVK_CHECK_VOID_RE(rr.fence_frame.Wait(vk_wait_time));
+     VVK_CHECK_VOID_RE(rr.fence_frame.Reset());
+     m_ex_swapchain->renderFrame();
++
++#ifdef _WIN32
++    if (m_frame_cb && eximg.mapped_ptr != nullptr) {
++        m_frame_cb(static_cast<const uint8_t*>(eximg.mapped_ptr),
++                   eximg.extent.width,
++                   eximg.extent.height,
++                   eximg.extent.width * 4u);
++    }
++#endif
++}
++
++bool VulkanRender::Impl::resizeOffscreen(uint32_t width, uint32_t height) {
++    if (! m_inited || m_with_surface || ! m_device) return false;
++    VVK_CHECK_BOOL_RE(m_device->handle().WaitIdle());
++    clearLastRenderGraph();
++    m_ex_swapchain.reset();
++
++    VkExtent2D extent { width, height };
++    m_device->set_out_extent(extent);
++    m_ex_swapchain = CreateExSwapchain(*m_device, width, height, VK_IMAGE_TILING_OPTIMAL);
++    if (! m_ex_swapchain) {
++        LOG_ERROR("resizeOffscreen: CreateExSwapchain failed (%ux%u)", width, height);
++        return false;
++    }
++    LOG_INFO("resized offscreen swapchain to %ux%u", width, height);
++    return true;
+ }
+ 
+ void VulkanRender::Impl::setRenderTargetSize(Scene& scene, rg::RenderGraph& rg) {
+@@ -442,13 +553,15 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
+     double fboAspect = width / (double)height, sAspect = sw / sh;
+     auto&  gCam    = *scene.cameras.at("global");
+     auto&  gPerCam = *scene.cameras.at("global_perspective");
++    double perDist = std::abs(gPerCam.GetPosition().z());
++    if (perDist < 1.0) perDist = 1000.0;
+     // assum cam
+     switch (fillmode) {
+     case FillMode::STRETCH:
+         gCam.SetWidth(sw);
+         gCam.SetHeight(sh);
+         gPerCam.SetAspect(sAspect);
+-        gPerCam.SetFov(algorism::CalculatePersperctiveFov(1000.0f, gCam.Height()));
++        gPerCam.SetFov(algorism::CalculatePersperctiveFov(perDist, gCam.Height()));
+         break;
+     case FillMode::ASPECTFIT:
+         if (fboAspect < sAspect) {
+@@ -460,7 +573,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
+             gCam.SetHeight(sh);
+         }
+         gPerCam.SetAspect(fboAspect);
+-        gPerCam.SetFov(algorism::CalculatePersperctiveFov(1000.0f, gCam.Height()));
++        gPerCam.SetFov(algorism::CalculatePersperctiveFov(perDist, gCam.Height()));
+         break;
+     case FillMode::ASPECTCROP:
+     default:
+@@ -473,7 +586,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
+             gCam.SetHeight(sh);
+         }
+         gPerCam.SetAspect(fboAspect);
+-        gPerCam.SetFov(algorism::CalculatePersperctiveFov(1000.0f, gCam.Height()));
++        gPerCam.SetFov(algorism::CalculatePersperctiveFov(perDist, gCam.Height()));
+         break;
+     }
+     gCam.Update();
+@@ -482,6 +595,9 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
+ }
+ 
+ void VulkanRender::Impl::clearLastRenderGraph() {
++    if (m_device && m_device->handle()) {
++        VVK_CHECK(m_device->handle().WaitIdle());
++    }
+     for (auto& p : m_passes) {
+         p->destory(*m_device, m_rendering_resources);
+     }
+diff --git a/src/VulkanRender/include/VulkanRender/VulkanRender.hpp b/src/VulkanRender/include/VulkanRender/VulkanRender.hpp
+index 031fb74..506c275 100644
+--- a/src/VulkanRender/include/VulkanRender/VulkanRender.hpp
++++ b/src/VulkanRender/include/VulkanRender/VulkanRender.hpp
+@@ -5,7 +5,9 @@
+ #include "Swapchain/ExSwapchain.hpp"
+ #include "Type.hpp"
+ 
++#include <cstdint>
+ #include <cstdio>
++#include <functional>
+ #include <memory>
+ 
+ namespace wallpaper
+@@ -16,6 +18,8 @@ namespace vulkan
+ {
+ class FinPass;
+ 
++using FrameCallback = std::function<void(const uint8_t* bgra, uint32_t width, uint32_t height, uint32_t stride)>;
++
+ class VulkanRender {
+ public:
+     VulkanRender();
+@@ -31,6 +35,9 @@ public:
+     void compileRenderGraph(Scene&, rg::RenderGraph&);
+     void UpdateCameraFillMode(Scene&, wallpaper::FillMode);
+ 
++    bool resizeOffscreen(uint32_t width, uint32_t height);
++    void setFrameCallback(FrameCallback cb);
++
+     ExSwapchain* exSwapchain() const;
+     bool inited() const;
+ 
+diff --git a/src/WPSceneParser.cpp b/src/WPSceneParser.cpp
+index 487c9f9..e8a0c5d 100644
+--- a/src/WPSceneParser.cpp
++++ b/src/WPSceneParser.cpp
+@@ -484,14 +484,17 @@ void ParseCamera(ParseContext& context, wpscene::WPSceneGeneral& general) {
+     scene.activeCamera->AttatchNode(context.global_camera_node);
+     scene.sceneGraph->AppendChild(context.global_camera_node);
+ 
++    double perspectiveFov = general.fov > 0.0f ? (double)general.fov : 50.0;
++    double perspectiveZ =
++        algorism::CalculatePersperctiveDistance(perspectiveFov, context.ortho_h);
+     scene.cameras["global_perspective"] =
+         std::make_shared<SceneCamera>((float)context.ortho_w / (float)context.ortho_h,
+                                       general.nearz,
+                                       general.farz,
+-                                      algorism::CalculatePersperctiveFov(1000.0f, context.ortho_h));
++                                      (float)perspectiveFov);
+ 
+     Vector3f cperori                       = cori;
+-    cperori[2]                             = 1000.0f;
++    cperori[2]                             = (float)perspectiveZ;
+     context.global_perspective_camera_node = std::make_shared<SceneNode>(cperori, cscale, cangle);
+     scene.cameras["global_perspective"]->AttatchNode(context.global_perspective_camera_node);
+     scene.sceneGraph->AppendChild(context.global_perspective_camera_node);
+@@ -1012,6 +1015,14 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
+             SetParticleMesh(mesh, particle_obj, mesh_maxcount, thick_format);
+     }
+ 
++    bool  is_perspective = particle_obj.flags[wpscene::Particle::FlagEnum::perspective];
++    float per_cam_z      = 1000.0f;
++    if (is_perspective && context.scene->cameras.count("global_perspective") != 0) {
++        per_cam_z = (float)context.scene->cameras.at("global_perspective")->GetPosition().z();
++    }
++    float node_origin_z = is_child ? child_ptr.child->origin[2] : wppartobj.origin[2];
++    float node_scale_z  = is_child ? child_ptr.child->scale[2] : wppartobj.scale[2];
++
+     auto particleSub = std::make_unique<ParticleSubSystem>(
+         *context.scene->paritileSys,
+         spMesh,
+@@ -1032,6 +1043,19 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
+                 lifetime = (1.0f - (p.lifetime / p.init.lifetime)) * sequencemultiplier;
+                 break;
+             }
++            if (is_perspective && spec.alpha != nullptr) {
++                float world_z    = node_origin_z + spec.pos_z * node_scale_z;
++                float dist       = per_cam_z - world_z;
++                float half_size  = spec.size != nullptr ? *spec.size : (p.size * 0.5f);
++                float fade_end   = std::max(half_size * 2.5f, per_cam_z * 0.05f);
++                float fade_start = std::max(half_size * 8.0f, per_cam_z * 0.15f);
++                if (dist <= fade_end) {
++                    *spec.alpha = 0.0f;
++                } else if (dist < fade_start) {
++                    float f = (dist - fade_end) / (fade_start - fade_end);
++                    *spec.alpha *= f;
++                }
++            }
+         });
+ 
+     LoadEmitter(*particleSub, particle_obj, override.count, render_rope);
+diff --git a/src/WPShaderParser.cpp b/src/WPShaderParser.cpp
+index 7c3eaec..28dc101 100644
+--- a/src/WPShaderParser.cpp
++++ b/src/WPShaderParser.cpp
+@@ -28,6 +28,7 @@ namespace
+ {
+ 
+ static constexpr const char* pre_shader_code = R"(#version 150
++#extension GL_ARB_separate_shader_objects : enable
+ #define GLSL 1
+ #define HLSL 0
+ #define highp
+@@ -359,6 +360,127 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
+     return std::regex_replace(unit.src, re_hold, insert_str);
+ }
+ 
++struct TopLevelIoDecl {
++    usize       start { 0 };
++    std::string name;
++    u32         slots { 1 };
++};
++
++inline u32 GlslTypeLocationSlots(const std::string& type, u32 arrCount) {
++    u32 base = 1;
++    if (type.find("mat4") != std::string::npos || type.find("dmat4") != std::string::npos)
++        base = 4;
++    else if (type.find("mat3") != std::string::npos || type.find("dmat3") != std::string::npos)
++        base = 3;
++    else if (type.find("mat2") != std::string::npos || type.find("dmat2") != std::string::npos)
++        base = 2;
++    return base * std::max<u32>(1, arrCount);
++}
++
++inline std::vector<TopLevelIoDecl> FindTopLevelStageIo(const std::string& src,
++                                                       std::string_view   storageQual) {
++    std::vector<TopLevelIoDecl> result;
++    const std::regex re_decl(
++        R"(^((?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)\s+)*(in|out)\s+((?:highp|mediump|lowp)\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(?:\s*\[\s*(\d+)\s*\])?\s*$)",
++        std::regex::ECMAScript);
++
++    int   braceDepth = 0;
++    usize stmtStart  = 0;
++    usize n          = src.size();
++
++    for (usize i = 0; i < n; i++) {
++        char c = src[i];
++        // Skip preprocessor lines
++        if (c == '#' && (i == 0 || src[i - 1] == '\n')) {
++            while (i < n && src[i] != '\n') i++;
++            if (braceDepth == 0) stmtStart = i + 1;
++            continue;
++        }
++        // Skip line comments
++        if (c == '/' && i + 1 < n && src[i + 1] == '/') {
++            while (i < n && src[i] != '\n') i++;
++            continue;
++        }
++        // Skip block comments
++        if (c == '/' && i + 1 < n && src[i + 1] == '*') {
++            i += 2;
++            while (i + 1 < n && ! (src[i] == '*' && src[i + 1] == '/')) i++;
++            i++;
++            continue;
++        }
++        if (c == '{') {
++            braceDepth++;
++        } else if (c == '}') {
++            if (braceDepth > 0) braceDepth--;
++            if (braceDepth == 0) stmtStart = i + 1;
++        } else if (c == ';' && braceDepth == 0) {
++            usize s = stmtStart;
++            while (s < i && std::isspace(static_cast<unsigned char>(src[s]))) s++;
++            usize e = i;
++            while (e > s && std::isspace(static_cast<unsigned char>(src[e - 1]))) e--;
++            if (e > s) {
++                std::string stmt = src.substr(s, e - s);
++                if (stmt.find("layout") == std::string::npos &&
++                    stmt.find('(') == std::string::npos &&
++                    stmt.find(',') == std::string::npos) {
++                    std::smatch m;
++                    if (std::regex_match(stmt, m, re_decl) && m[2].str() == storageQual) {
++                        std::string varName = m[5].str();
++                        if (! sstart_with(varName, "gl_")) {
++                            u32 arrCount = 1;
++                            if (m[6].matched) {
++                                u32 parsed = 1;
++                                auto arrStr = m[6].str();
++                                std::from_chars(arrStr.data(), arrStr.data() + arrStr.size(), parsed);
++                                arrCount = std::max<u32>(1, parsed);
++                            }
++                            result.push_back(TopLevelIoDecl {
++                                .start = s,
++                                .name  = varName,
++                                .slots = GlslTypeLocationSlots(m[4].str(), arrCount),
++                            });
++                        }
++                    }
++                }
++            }
++            stmtStart = i + 1;
++        }
++    }
++    return result;
++}
++
++inline void AssignInterStageLocations(std::string& prevSrc, std::string& nextSrc) {
++    auto outs = FindTopLevelStageIo(prevSrc, "out");
++    auto ins  = FindTopLevelStageIo(nextSrc, "in");
++    if (outs.empty() && ins.empty()) return;
++
++    std::map<std::string, u32> slotCounts;
++    for (const auto& d : outs) {
++        slotCounts[d.name] = std::max(slotCounts[d.name], d.slots);
++    }
++    for (const auto& d : ins) {
++        slotCounts[d.name] = std::max(slotCounts[d.name], d.slots);
++    }
++
++    std::map<std::string, u32> locMap;
++    u32                        nextLoc = 0;
++    for (const auto& [name, slots] : slotCounts) {
++        locMap[name] = nextLoc;
++        nextLoc += slots;
++    }
++
++    auto applyLocs = [&locMap](std::string& src, const std::vector<TopLevelIoDecl>& decls) {
++        // Insert in reverse offset order so earlier offsets stay valid.
++        for (auto it = decls.rbegin(); it != decls.rend(); ++it) {
++            auto locIt = locMap.find(it->name);
++            if (locIt == locMap.end()) continue;
++            src.insert(it->start, "layout(location = " + std::to_string(locIt->second) + ") ");
++        }
++    };
++    applyLocs(prevSrc, outs);
++    applyLocs(nextSrc, ins);
++}
++
+ inline std::string GenSha1(std::span<const WPShaderUnit> units) {
+     std::string shas;
+     for (auto& unit : units) {
+@@ -473,6 +595,9 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
+             vunit.src   = unit.src;
+             vunit.stage = ToGLSL(unit.stage);
+         }
++        for (usize i = 0; i + 1 < vunits.size(); i++) {
++            AssignInterStageLocations(vunits[i].src, vunits[i + 1].src);
++        }
+ 
+         vulkan::ShaderCompOpt opt;
+         opt.client_ver             = glslang::EShTargetVulkan_1_1;
