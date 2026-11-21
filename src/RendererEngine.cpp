@@ -292,13 +292,21 @@ void RendererEngine::SetPaused(bool paused) {
 
 void RendererEngine::InjectTestAudioTone(float frequencyHz, float amplitude) {
     if (! m_audio) return;
-    constexpr std::size_t kSamples   = 256;
+    constexpr std::size_t kSamples    = 1024;
     constexpr float       kSampleRate = 48000.0f;
+    // Rich multi-band chord (sub-bass, bass, low-mid, mid, treble) so both bass-only and full-spectrum
+    // visualizers respond clearly during offline verification.
+    static constexpr float kFreqs[] = { 60.0f, 95.0f, 140.0f, 210.0f, 320.0f, 520.0f, 900.0f, 1800.0f };
     std::array<float, kSamples> pcm {};
     for (std::size_t i = 0; i < kSamples; ++i) {
-        pcm[i] = amplitude * std::sin(2.0f * 3.14159265f * frequencyHz * static_cast<float>(i) / kSampleRate);
+        float t = static_cast<float>(i) / kSampleRate;
+        float s = 0.0f;
+        for (float f : kFreqs) {
+            s += std::sin(2.0f * 3.14159265f * f * t);
+        }
+        s += std::sin(2.0f * 3.14159265f * frequencyHz * t);
+        pcm[i] = amplitude * (s / 4.0f);
     }
-    // Feed multiple windows so temporal smoothing converges
     for (int k = 0; k < 8; ++k) {
         m_audio->FeedPcmSamples(pcm.data(), pcm.data(), kSamples);
     }

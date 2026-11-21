@@ -439,7 +439,7 @@ index 4bdaedc..815ed6f 100644
  }
  
 diff --git a/src/Vulkan/Shader.cpp b/src/Vulkan/Shader.cpp
-index e91ed11..a283b4e 100644
+index e91ed11..50dfc61 100644
 --- a/src/Vulkan/Shader.cpp
 +++ b/src/Vulkan/Shader.cpp
 @@ -1,9 +1,8 @@
@@ -463,7 +463,18 @@ index e91ed11..a283b4e 100644
                         client,
                         ClientInputSemanticsVersion);
      shader.setEnvClient(client, opt.client_ver);
-@@ -106,8 +105,8 @@ inline bool parse(const ShaderCompUnit& unit, const ShaderCompOpt& opt, EShMessa
+@@ -103,11 +102,19 @@ inline bool parse(const ShaderCompUnit& unit, const ShaderCompOpt& opt, EShMessa
+     if (opt.auto_map_bindings) shader.setAutoMapBindings(true);
+     if (opt.relaxed_rules_vulkan) {
+         shader.setGlobalUniformBinding(opt.global_uniform_binding);
++        if (opt.auto_map_bindings) {
++            // Reserve binding 0 for gl_DefaultUniformBlock so fragment-only combined samplers
++            // (e.g. composelayer's `uniform sampler2D g_Texture0`) never collide with vertex-stage
++            // gl_DefaultUniformBlock at binding 0.
++            shader.setShiftBinding(glslang::EResCombinedSampler, opt.global_uniform_binding + 1);
++            shader.setShiftBinding(glslang::EResTexture, opt.global_uniform_binding + 1);
++            shader.setShiftBinding(glslang::EResSampler, opt.global_uniform_binding + 1);
++        }
          shader.setEnvInputVulkanRulesRelaxed();
      }
      const int        default_ver = 110; // 100 for es, 110 for desktop
@@ -474,7 +485,7 @@ index e91ed11..a283b4e 100644
          std::string tmp_name = logToTmpfileWithSha1(unit.src, "%s", unit.src.c_str());
          LOG_INFO("--- shader compile failed ---");
          LOG_ERROR("shader source is at %s", tmp_name.c_str());
-@@ -125,14 +124,6 @@ inline void SetMessageOptions(const ShaderCompOpt& opt, EShMessages& emsg) {
+@@ -125,14 +132,6 @@ inline void SetMessageOptions(const ShaderCompOpt& opt, EShMessages& emsg) {
      if (getClient(opt.client_ver) == glslang::EShClientVulkan)
          emsg = (EShMessages)(emsg | EShMsgVulkanRules);
  }
@@ -489,7 +500,28 @@ index e91ed11..a283b4e 100644
  } // namespace
  const TBuiltInResource wallpaper::vulkan::DefaultTBuiltInResource {
      .maxLights =  32,
-@@ -427,21 +418,14 @@ bool wallpaper::vulkan::CompileAndLinkShaderUnits(std::span<const ShaderCompUnit
+@@ -347,6 +346,20 @@ bool wallpaper::vulkan::GenReflect(std::span<const std::vector<uint>> codes,
+             if (exists(ref.binding_map, bind_name)) {
+                 auto& bind = ref.binding_map[bind_name];
+                 bind.stageFlags |= stage;
++                if (b.descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
++                    ! ref.blocks.empty()) {
++                    auto& ref_block = ref.blocks.front();
++                    if (b.block.size > ref_block.size) ref_block.size = b.block.size;
++                    for (u32 i = 0; i < b.block.member_count; i++) {
++                        auto& unif = b.block.members[i];
++                        if (! exists(ref_block.member_map, unif.name)) {
++                            ShaderReflected::BlockedUniform bunif {};
++                            bunif.size                      = unif.size;
++                            bunif.offset                    = unif.offset;
++                            ref_block.member_map[unif.name] = bunif;
++                        }
++                    }
++                }
+                 continue;
+             }
+             if (b.descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+@@ -427,21 +440,14 @@ bool wallpaper::vulkan::CompileAndLinkShaderUnits(std::span<const ShaderCompUnit
          return false;
      }
  
@@ -513,7 +545,7 @@ index e91ed11..a283b4e 100644
      spvOptions.generateDebugInfo = false;
  
      spvs.clear();
-@@ -449,7 +433,6 @@ bool wallpaper::vulkan::CompileAndLinkShaderUnits(std::span<const ShaderCompUnit
+@@ -449,7 +455,6 @@ bool wallpaper::vulkan::CompileAndLinkShaderUnits(std::span<const ShaderCompUnit
          Uni_ShaderSpv spv = std::make_unique<ShaderSpv>();
          spv->stage        = ::ToGeneType(::ToVkType(unit.stage));
          auto im           = program.getIntermediate(unit.stage);
@@ -521,7 +553,7 @@ index e91ed11..a283b4e 100644
          glslang::GlslangToSpv(*im, spv->spirv, &logger, &spvOptions);
          spvs.emplace_back(std::move(spv));
  
-@@ -459,27 +442,3 @@ bool wallpaper::vulkan::CompileAndLinkShaderUnits(std::span<const ShaderCompUnit
+@@ -459,27 +464,3 @@ bool wallpaper::vulkan::CompileAndLinkShaderUnits(std::span<const ShaderCompUnit
  
      return true;
  }
@@ -1770,7 +1802,7 @@ index 487c9f9..61b415f 100644
  
      LoadEmitter(*particleSub, particle_obj, override.count, render_rope);
 diff --git a/src/WPShaderParser.cpp b/src/WPShaderParser.cpp
-index 7c3eaec..72ee0a3 100644
+index 7c3eaec..e03c5d9 100644
 --- a/src/WPShaderParser.cpp
 +++ b/src/WPShaderParser.cpp
 @@ -28,6 +28,7 @@ namespace
@@ -1781,15 +1813,27 @@ index 7c3eaec..72ee0a3 100644
  #define GLSL 1
  #define HLSL 0
  #define highp
-@@ -359,6 +360,127 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
+@@ -359,6 +360,176 @@ inline std::string Finalprocessor(const WPShaderUnit& unit, const WPPreprocessor
      return std::regex_replace(unit.src, re_hold, insert_str);
  }
  
 +struct TopLevelIoDecl {
 +    usize       start { 0 };
++    usize       end { 0 };
++    std::string prefix;
++    std::string type;
 +    std::string name;
 +    u32         slots { 1 };
++    bool        isArray { false };
 +};
++
++inline int GlslVecDim(const std::string& type) {
++    if (type == "float") return 1;
++    if (type == "vec2") return 2;
++    if (type == "vec3") return 3;
++    if (type == "vec4") return 4;
++    return 0;
++}
 +
 +inline u32 GlslTypeLocationSlots(const std::string& type, u32 arrCount) {
 +    u32 base = 1;
@@ -1852,17 +1896,23 @@ index 7c3eaec..72ee0a3 100644
 +                    if (std::regex_match(stmt, m, re_decl) && m[2].str() == storageQual) {
 +                        std::string varName = m[5].str();
 +                        if (! sstart_with(varName, "gl_")) {
-+                            u32 arrCount = 1;
++                            u32  arrCount = 1;
++                            bool isArr    = false;
 +                            if (m[6].matched) {
-+                                u32 parsed = 1;
++                                u32  parsed = 1;
 +                                auto arrStr = m[6].str();
 +                                std::from_chars(arrStr.data(), arrStr.data() + arrStr.size(), parsed);
 +                                arrCount = std::max<u32>(1, parsed);
++                                isArr    = true;
 +                            }
 +                            result.push_back(TopLevelIoDecl {
-+                                .start = s,
-+                                .name  = varName,
-+                                .slots = GlslTypeLocationSlots(m[4].str(), arrCount),
++                                .start   = s,
++                                .end     = i + 1,
++                                .prefix  = m[1].matched ? m[1].str() : "",
++                                .type    = m[4].str(),
++                                .name    = varName,
++                                .slots   = GlslTypeLocationSlots(m[4].str(), arrCount),
++                                .isArray = isArr,
 +                            });
 +                        }
 +                    }
@@ -1879,9 +1929,11 @@ index 7c3eaec..72ee0a3 100644
 +    auto ins  = FindTopLevelStageIo(nextSrc, "in");
 +    if (outs.empty() && ins.empty()) return;
 +
-+    std::map<std::string, u32> slotCounts;
++    std::map<std::string, u32>        slotCounts;
++    std::map<std::string, std::string> outTypes;
 +    for (const auto& d : outs) {
 +        slotCounts[d.name] = std::max(slotCounts[d.name], d.slots);
++        if (! d.isArray) outTypes[d.name] = d.type;
 +    }
 +    for (const auto& d : ins) {
 +        slotCounts[d.name] = std::max(slotCounts[d.name], d.slots);
@@ -1894,22 +1946,51 @@ index 7c3eaec..72ee0a3 100644
 +        nextLoc += slots;
 +    }
 +
-+    auto applyLocs = [&locMap](std::string& src, const std::vector<TopLevelIoDecl>& decls) {
-+        // Insert in reverse offset order so earlier offsets stay valid.
-+        for (auto it = decls.rbegin(); it != decls.rend(); ++it) {
-+            auto locIt = locMap.find(it->name);
-+            if (locIt == locMap.end()) continue;
-+            src.insert(it->start, "layout(location = " + std::to_string(locIt->second) + ") ");
++    // Apply layout(location = N) to prevSrc outputs
++    for (auto it = outs.rbegin(); it != outs.rend(); ++it) {
++        auto locIt = locMap.find(it->name);
++        if (locIt == locMap.end()) continue;
++        prevSrc.insert(it->start, "layout(location = " + std::to_string(locIt->second) + ") ");
++    }
++
++    // Apply layout(location = N) to nextSrc inputs, harmonizing HLSL-style vec width mismatches
++    // (e.g. vertex `out vec4 v_TexCoord` vs fragment `in vec2 v_TexCoord`).
++    for (auto it = ins.rbegin(); it != ins.rend(); ++it) {
++        auto locIt = locMap.find(it->name);
++        if (locIt == locMap.end()) continue;
++        std::string locPrefix = "layout(location = " + std::to_string(locIt->second) + ") ";
++
++        auto otIt = outTypes.find(it->name);
++        if (! it->isArray && otIt != outTypes.end() && otIt->second != it->type) {
++            int outDim = GlslVecDim(otIt->second);
++            int inDim  = GlslVecDim(it->type);
++            if (outDim > 0 && inDim > 0) {
++                std::string rawName = "_we_stage_" + it->name;
++                std::string expr;
++                if (outDim > inDim) {
++                    static constexpr const char* kSwizzles[] = { "", ".x", ".xy", ".xyz", ".xyzw" };
++                    expr = "(" + rawName + kSwizzles[inDim] + ")";
++                } else {
++                    std::string pad;
++                    for (int k = outDim; k < inDim; ++k) {
++                        pad += (k == 3) ? ", 1.0" : ", 0.0";
++                    }
++                    expr = it->type + "(" + rawName + pad + ")";
++                }
++                std::string repl = locPrefix + it->prefix + "in " + otIt->second + " " + rawName +
++                                   ";\n#define " + it->name + " " + expr + "\n";
++                nextSrc.replace(it->start, it->end - it->start, repl);
++                continue;
++            }
 +        }
-+    };
-+    applyLocs(prevSrc, outs);
-+    applyLocs(nextSrc, ins);
++        nextSrc.insert(it->start, locPrefix);
++    }
 +}
 +
  inline std::string GenSha1(std::span<const WPShaderUnit> units) {
      std::string shas;
      for (auto& unit : units) {
-@@ -470,9 +592,49 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
+@@ -470,9 +641,60 @@ bool WPShaderParser::CompileToSpv(std::string_view scene_id, std::span<WPShaderU
  
              unit.src = Finalprocessor(unit, pre_info, post_info);
  
@@ -1947,6 +2028,17 @@ index 7c3eaec..72ee0a3 100644
 +                        patched.append(unit.src, last, std::string::npos);
 +                        unit.src.swap(patched);
 +                    }
++                }
++
++                // Vulkan GLSL rejects `float % int` and `uint + int` in HLSL-authored audio shaders
++                // like Simple Audio Bars (`uint barFreq1 = frequency % 64; uint barFreq2 = (barFreq1 + 1) % 64;`).
++                {
++                    const std::regex reFloatMod(
++                        R"(\buint\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*%\s*(\d+)\s*;)");
++                    unit.src = std::regex_replace(unit.src, reFloatMod, "uint $1 = uint($2) % $3u;");
++                    const std::regex reUintAddMod(
++                        R"(\buint\s+([A-Za-z_]\w*)\s*=\s*\(\s*([A-Za-z_]\w*)\s*\+\s*(\d+)\s*\)\s*%\s*(\d+)\s*;)");
++                    unit.src = std::regex_replace(unit.src, reUintAddMod, "uint $1 = ($2 + $3u) % $4u;");
 +                }
 +            }
 +

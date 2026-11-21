@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 
@@ -48,10 +49,11 @@ private:
     mutable std::mutex m_mutex;
     AudioSpectrumData  m_spectrum {};
 
-    static constexpr std::size_t kFftSize = 256;
+    static constexpr std::size_t kFftSize = 1024;
     std::array<float, kFftSize>  m_ringL {};
     std::array<float, kFftSize>  m_ringR {};
     std::size_t                  m_ringPos { 0 };
+    uint32_t                     m_sampleRate { 48000 };
 };
 
 } // namespace lcdfusion_wpe

@@ -179,11 +179,15 @@ int RunDumpMode(int argc, char** argv) {
         return 1;
     }
     if (testAudio) {
-        engine.InjectTestAudioTone(440.0f, 0.9f);
+        engine.SetPaused(true);
+        engine.InjectTestAudioTone(220.0f, 1.0f);
     }
 
     auto t0 = std::chrono::steady_clock::now();
     for (int f = 0; f < frames; ++f) {
+        if (testAudio) {
+            engine.InjectTestAudioTone(220.0f, 1.0f);
+        }
         if (! engine.RenderFrame(1.0 / 30.0)) {
             std::fprintf(stderr, "RenderFrame failed at frame %d\n", f);
             return 1;

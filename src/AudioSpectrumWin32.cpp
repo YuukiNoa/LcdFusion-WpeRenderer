@@ -1,4 +1,5 @@
 #include "AudioSpectrumWin32.hpp"
+#include "Utils/Logging.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
@@ -30,8 +31,8 @@ const GUID kSubformatPcm = {
     0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 }
 };
 
-void Radix2Fft(std::array<std::complex<float>, 256>& a) {
-    constexpr std::size_t N = 256;
+void Radix2Fft(std::array<std::complex<float>, 1024>& a) {
+    constexpr std::size_t N = 1024;
     // Bit-reversal permutation
     for (std::size_t i = 1, j = 0; i < N; ++i) {
         std::size_t bit = N >> 1;
@@ -135,16 +136,42 @@ void WasapiAudioAnalyzer::ComputeBandsFromWindow() {
     std::array<float, 64> rawL {};
     std::array<float, 64> rawR {};
 
-    // Map bins 1..127 across 64 bands (2 bins per band with slight high-frequency boost, matching WE scale).
-    constexpr float kNorm = 1.0f / static_cast<float>(kFftSize * 0.25f);
+    // Logarithmic perceptual mapping (~45 Hz .. ~16 kHz) across 64 bands so bass (45-350 Hz)
+    // maps cleanly into low bands [0..15] matching Wallpaper Engine visualizers.
+    constexpr float kNorm     = 1.0f / static_cast<float>(kFftSize * 0.25f);
+    const double    sr        = static_cast<double>(m_sampleRate > 0 ? m_sampleRate : 48000);
+    const double    minHz     = 45.0;
+    const double    maxHz     = std::min(16000.0, sr * 0.45);
+    const double    logRatio  = std::log(maxHz / minHz);
+    const std::size_t maxBin  = kFftSize / 2 - 1;
+
     for (std::size_t b = 0; b < 64; ++b) {
-        std::size_t bin0  = std::min<std::size_t>(1 + b * 2, kFftSize / 2 - 1);
-        std::size_t bin1  = std::min<std::size_t>(bin0 + 1, kFftSize / 2 - 1);
-        float       magL  = 0.5f * (std::abs(fftL[bin0]) + std::abs(fftL[bin1])) * kNorm;
-        float       magR  = 0.5f * (std::abs(fftR[bin0]) + std::abs(fftR[bin1])) * kNorm;
-        float       boost = 1.0f + 0.6f * (static_cast<float>(b) / 63.0f);
-        rawL[b]           = std::clamp(std::sqrt(magL * boost), 0.0f, 1.5f);
-        rawR[b]           = std::clamp(std::sqrt(magR * boost), 0.0f, 1.5f);
+        double f0 = minHz * std::exp(logRatio * (static_cast<double>(b) / 64.0));
+        double f1 = minHz * std::exp(logRatio * (static_cast<double>(b + 1) / 64.0));
+        std::size_t bin0 = std::clamp<std::size_t>(
+            static_cast<std::size_t>(std::floor(f0 * kFftSize / sr)), 1, maxBin);
+        std::size_t bin1 = std::clamp<std::size_t>(
+            static_cast<std::size_t>(std::ceil(f1 * kFftSize / sr)), bin0, maxBin);
+
+        float peakL = 0.0f;
+        float peakR = 0.0f;
+        float sumL  = 0.0f;
+        float sumR  = 0.0f;
+        std::size_t cnt = 0;
+        for (std::size_t k = bin0; k <= bin1; ++k) {
+            float mL = std::abs(fftL[k]) * kNorm;
+            float mR = std::abs(fftR[k]) * kNorm;
+            peakL    = std::max(peakL, mL);
+            peakR    = std::max(peakR, mR);
+            sumL += mL;
+            sumR += mR;
+            ++cnt;
+        }
+        float magL  = 0.65f * peakL + 0.35f * (sumL / static_cast<float>(std::max<std::size_t>(1, cnt)));
+        float magR  = 0.65f * peakR + 0.35f * (sumR / static_cast<float>(std::max<std::size_t>(1, cnt)));
+        float boost = 1.15f + 0.85f * (static_cast<float>(b) / 63.0f);
+        rawL[b]     = std::clamp(std::sqrt(magL * boost), 0.0f, 1.5f);
+        rawR[b]     = std::clamp(std::sqrt(magR * boost), 0.0f, 1.5f);
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -255,13 +282,20 @@ void WasapiAudioAnalyzer::CaptureLoop() {
 
         hr = client->Start();
         if (FAILED(hr)) {
+            LOG_ERROR("WasapiAudioAnalyzer: IAudioClient::Start failed hr=0x%08X", static_cast<unsigned>(hr));
             cleanup();
             Sleep(500);
             continue;
         }
 
+        m_sampleRate            = wfex->nSamplesPerSec > 0 ? wfex->nSamplesPerSec : 48000;
         const uint32_t channels = wfex->nChannels;
+        LOG_INFO("WasapiAudioAnalyzer: loopback active (%u Hz, %u ch, %s)",
+                 m_sampleRate,
+                 channels,
+                 isFloat ? "float32" : "pcm16");
 
+        int emptyPolls = 0;
         while (m_running.load()) {
             if (m_paused.load()) {
                 Sleep(40);
@@ -273,11 +307,15 @@ void WasapiAudioAnalyzer::CaptureLoop() {
             if (FAILED(hr)) break;
 
             if (packetLength == 0) {
-                // Smooth decay when no audio packet arrives (system silent in WASAPI loopback)
-                PushSamplesAndAnalyze(zeros.data(), zeros.data(), zeros.size());
+                ++emptyPolls;
+                if (emptyPolls >= 3) {
+                    // Smooth decay only after sustained silence (~45 ms without audio packets)
+                    PushSamplesAndAnalyze(zeros.data(), zeros.data(), zeros.size());
+                }
                 Sleep(15);
                 continue;
             }
+            emptyPolls = 0;
 
             while (packetLength > 0 && m_running.load()) {
                 BYTE*  data      = nullptr;

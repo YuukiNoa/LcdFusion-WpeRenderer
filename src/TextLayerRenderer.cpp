@@ -346,25 +346,31 @@ void TextLayerRenderer::CompositeOntoBgra(uint8_t* bgra, uint32_t outW, uint32_t
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     g.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
 
-    const double camLeft   = orthoW * 0.5 - camW * 0.5;
-    const double camTop    = orthoH * 0.5 + camH * 0.5;
-    const double pxPerUnitX = static_cast<double>(outW) / camW;
-    const double pxPerUnitY = static_cast<double>(outH) / camH;
+    const double safeOrthoW = (orthoW > 1.0) ? orthoW : camW;
+    const double safeOrthoH = (orthoH > 1.0) ? orthoH : camH;
+    const double scaleXOut  = static_cast<double>(outW) / safeOrthoW;
+    const double scaleYOut  = static_cast<double>(outH) / safeOrthoH;
+    // Use geometric mean so text stays legible and proportional across 16:9, 1:1 (480x480),
+    // portrait (360x960), and ultra-wide (1920x462) LCD panels.
+    const double textUnitScale = std::sqrt(scaleXOut * scaleYOut);
 
     for (const auto& layer : m_layers) {
         if (! layer.visible || layer.alpha <= 0.005f || layer.text.empty()) continue;
 
-        const double sx = (static_cast<double>(layer.origin[0]) - camLeft) * pxPerUnitX;
-        const double sy = (camTop - static_cast<double>(layer.origin[1])) * pxPerUnitY;
+        // Map scene ortho origin proportionally onto the output LCD viewport so corner HUD/clock
+        // layers (e.g. top-left clocks in 16:9 wallpapers) remain visible inside non-16:9 screens
+        // while staying pixel-exact on matching aspect ratios.
+        const double sx = (static_cast<double>(layer.origin[0]) / safeOrthoW) * static_cast<double>(outW);
+        const double sy = (1.0 - static_cast<double>(layer.origin[1]) / safeOrthoH) * static_cast<double>(outH);
 
         const float scaleX = std::max(0.01f, std::abs(layer.scale[0]));
         const float scaleY = std::max(0.01f, std::abs(layer.scale[1]));
-        const float boxW   = std::max(16.0f, static_cast<float>(layer.size[0] * pxPerUnitX * scaleX));
-        const float boxH   = std::max(16.0f, static_cast<float>(layer.size[1] * pxPerUnitY * scaleY));
+        const float boxW   = std::max(24.0f, static_cast<float>(layer.size[0] * textUnitScale * scaleX));
+        const float boxH   = std::max(18.0f, static_cast<float>(layer.size[1] * textUnitScale * scaleY));
 
-        // Wallpaper Engine pointsize scales with scene ortho pixels (approx 4/3 px per pt at 96 DPI).
-        float fontPx = static_cast<float>(std::max(1.0f, layer.pointSize) * 1.3333 * pxPerUnitY * scaleY);
-        fontPx       = std::clamp(fontPx, 6.0f, static_cast<float>(outH));
+        // Wallpaper Engine text pointsize corresponds to ~192 DPI (8/3 px per pt in scene ortho units).
+        float fontPx = static_cast<float>(std::max(1.0f, layer.pointSize) * 2.6667 * textUnitScale * scaleY);
+        fontPx       = std::clamp(fontPx, 9.0f, static_cast<float>(outH));
 
         auto font = m_impl->CreateFontForLayer(layer, fontPx);
         if (! font) continue;
@@ -384,7 +390,8 @@ void TextLayerRenderer::CompositeOntoBgra(uint8_t* bgra, uint32_t outW, uint32_t
             g.RotateTransform(deg);
         }
 
-        // Compute draw rect relative to layer origin according to horizontal/vertical alignment.
+        // Align relative to layer origin using point-based DrawString so text never wraps or clips
+        // inside tight scene.json bounding boxes when limitwidth is disabled.
         Gdiplus::StringFormat fmt;
         float rectX = -boxW * 0.5f;
         float rectY = -boxH * 0.5f;
@@ -411,19 +418,18 @@ void TextLayerRenderer::CompositeOntoBgra(uint8_t* bgra, uint32_t outW, uint32_t
             rectY = -boxH * 0.5f;
         }
 
-        // Generous layout box so slightly wider glyphs don't clip unnecessarily.
-        Gdiplus::RectF rect(rectX, rectY, boxW, boxH);
         if (layer.opaqueBackground) {
+            Gdiplus::RectF      bgRect(rectX, rectY, boxW, boxH);
             Gdiplus::SolidBrush bgBrush(Gdiplus::Color(
                 a, toByte(layer.backgroundColor[0]), toByte(layer.backgroundColor[1]), toByte(layer.backgroundColor[2])));
-            g.FillRectangle(&bgBrush, rect);
+            g.FillRectangle(&bgBrush, bgRect);
         }
 
-        fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoClip);
+        fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoClip | Gdiplus::StringFormatFlagsNoWrap);
 
-        std::wstring wtext = Utf8ToWideText(layer.text);
+        std::wstring        wtext = Utf8ToWideText(layer.text);
         Gdiplus::SolidBrush textBrush(Gdiplus::Color(a, r, gr, b));
-        g.DrawString(wtext.c_str(), -1, font.get(), rect, &fmt, &textBrush);
+        g.DrawString(wtext.c_str(), -1, font.get(), Gdiplus::PointF(0.0f, 0.0f), &fmt, &textBrush);
 
         g.Restore(st);
     }
