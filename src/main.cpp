@@ -226,12 +226,12 @@ int RunIpcMode(const std::string& pipeBaseName) {
     if (! pipeBaseName.empty()) {
         std::string inPath  = "\\\\.\\pipe\\" + pipeBaseName + "_in";
         std::string outPath = "\\\\.\\pipe\\" + pipeBaseName + "_out";
-        hPipeIn             = OpenNamedPipeWithRetry(inPath, GENERIC_READ);
+        hPipeIn             = OpenNamedPipeWithRetry(inPath, FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE);
         if (hPipeIn == INVALID_HANDLE_VALUE) {
             std::fprintf(stderr, "Failed to open IPC input pipe: %s (err=%lu)\n", inPath.c_str(), GetLastError());
             return 3;
         }
-        g_pipeOut = OpenNamedPipeWithRetry(outPath, GENERIC_WRITE);
+        g_pipeOut = OpenNamedPipeWithRetry(outPath, FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE);
         if (g_pipeOut == INVALID_HANDLE_VALUE) {
             std::fprintf(stderr, "Failed to open IPC output pipe: %s (err=%lu)\n", outPath.c_str(), GetLastError());
             CloseHandle(hPipeIn);
