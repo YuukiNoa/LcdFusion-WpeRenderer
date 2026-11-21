@@ -156,10 +156,44 @@ target_link_libraries(wescene-core PUBLIC
     Threads::Threads
 )
 
+# QuickJS-ng static library (MIT, embedded ES2023/ESM runtime for SceneScript)
+set(QJS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs-ng")
+add_library(qjs-static STATIC
+    "${QJS_DIR}/dtoa.c"
+    "${QJS_DIR}/libregexp.c"
+    "${QJS_DIR}/libunicode.c"
+    "${QJS_DIR}/quickjs.c"
+)
+set_target_properties(qjs-static PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    C_EXTENSIONS ON
+)
+target_include_directories(qjs-static PUBLIC "${QJS_DIR}")
+target_compile_definitions(qjs-static PRIVATE
+    QUICKJS_NG_BUILD
+    _GNU_SOURCE
+    WIN32_LEAN_AND_MEAN
+    _WIN32_WINNT=0x0601
+)
+target_compile_options(qjs-static PRIVATE
+    -funsigned-char
+    -Wno-implicit-fallthrough
+    -Wno-sign-compare
+    -Wno-missing-field-initializers
+    -Wno-unused-parameter
+    -Wno-unused-but-set-variable
+    -Wno-unused-result
+    -Wno-stringop-truncation
+    -Wno-array-bounds
+)
+
 # Standalone offscreen renderer executable (x64)
 add_executable(wpe-renderer
     src/AudioSpectrumWin32.cpp
     src/VideoPlayerWin32.cpp
+    src/TextLayerRenderer.cpp
+    src/SceneScriptEngine.cpp
     src/ShmWriter.cpp
     src/RendererEngine.cpp
     src/main.cpp
@@ -167,6 +201,9 @@ add_executable(wpe-renderer
 
 target_link_libraries(wpe-renderer PRIVATE
     wescene-core
+    qjs-static
+    gdiplus
+    gdi32
     mfplat
     mfreadwrite
     mfuuid
@@ -180,6 +217,7 @@ if(MINGW)
     target_link_options(wpe-renderer PRIVATE
         -static-libgcc
         -static-libstdc++
+        -Wl,--stack,8388608
         -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive,-Bdynamic
     )
 endif()

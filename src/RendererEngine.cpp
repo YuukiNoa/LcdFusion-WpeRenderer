@@ -1,5 +1,7 @@
 #include "RendererEngine.hpp"
 #include "AudioSpectrumWin32.hpp"
+#include "SceneScriptEngine.hpp"
+#include "TextLayerRenderer.hpp"
 #include "VideoPlayerWin32.hpp"
 
 #include "Audio/SoundManager.h"
@@ -10,6 +12,7 @@
 #include "Particle/ParticleSystem.h"
 #include "RenderGraph/RenderGraph.hpp"
 #include "Scene/Scene.h"
+#include "Scene/SceneCamera.h"
 #include "SceneWallpaperSurface.hpp"
 #include "Utils/Logging.h"
 #include "VulkanRender/SceneToRenderGraph.hpp"
@@ -23,6 +26,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <unordered_map>
@@ -228,13 +232,56 @@ RendererEngine::RendererEngine()
       m_sound(std::make_unique<wallpaper::audio::SoundManager>()),
       m_render(std::make_unique<wallpaper::vulkan::VulkanRender>()),
       m_video(std::make_unique<VideoPlayerWin32>()),
-      m_audio(std::make_unique<WasapiAudioAnalyzer>()) {}
+      m_audio(std::make_unique<WasapiAudioAnalyzer>()),
+      m_text(std::make_unique<TextLayerRenderer>()),
+      m_scripts(std::make_unique<SceneScriptEngine>()) {}
 
 RendererEngine::~RendererEngine() { Shutdown(); }
 
+void RendererEngine::HandleVulkanFrame(const uint8_t* bgra, uint32_t width, uint32_t height,
+                                       uint32_t stride) {
+    if (! m_frameConsumer) return;
+    if (m_text && m_text->HasVisibleLayers() && m_scene) {
+        const uint32_t tightStride = width * 4;
+        m_compositeBgra.resize(static_cast<std::size_t>(tightStride) * height);
+        if (stride == tightStride) {
+            std::memcpy(m_compositeBgra.data(), bgra, m_compositeBgra.size());
+        } else {
+            for (uint32_t y = 0; y < height; ++y) {
+                std::memcpy(m_compositeBgra.data() + static_cast<std::size_t>(y) * tightStride,
+                            bgra + static_cast<std::size_t>(y) * stride,
+                            tightStride);
+            }
+        }
+        double camW = static_cast<double>(m_scene->ortho[0]);
+        double camH = static_cast<double>(m_scene->ortho[1]);
+        auto   itC  = m_scene->cameras.find("global");
+        if (itC != m_scene->cameras.end() && itC->second) {
+            camW = itC->second->Width();
+            camH = itC->second->Height();
+        }
+        m_text->CompositeOntoBgra(m_compositeBgra.data(),
+                                  width,
+                                  height,
+                                  tightStride,
+                                  static_cast<double>(m_scene->ortho[0]),
+                                  static_cast<double>(m_scene->ortho[1]),
+                                  camW,
+                                  camH);
+        m_frameConsumer(m_compositeBgra.data(), width, height, tightStride);
+    } else {
+        m_frameConsumer(bgra, width, height, stride);
+    }
+}
+
 void RendererEngine::SetFrameConsumer(FrameConsumer consumer) {
     m_frameConsumer = std::move(consumer);
-    if (m_render) m_render->setFrameCallback(m_frameConsumer);
+    if (m_render) {
+        m_render->setFrameCallback(
+            [this](const uint8_t* bgra, uint32_t w, uint32_t h, uint32_t stride) {
+                HandleVulkanFrame(bgra, w, h, stride);
+            });
+    }
     if (m_video) m_video->SetFrameConsumer(m_frameConsumer);
 }
 
@@ -277,7 +324,10 @@ bool RendererEngine::InitVulkanIfNeeded(uint32_t width, uint32_t height, std::st
     info.width              = static_cast<uint16_t>(std::clamp<uint32_t>(width, 64, 4096));
     info.height             = static_cast<uint16_t>(std::clamp<uint32_t>(height, 64, 4096));
 
-    m_render->setFrameCallback(m_frameConsumer);
+    m_render->setFrameCallback(
+        [this](const uint8_t* bgra, uint32_t w, uint32_t h, uint32_t stride) {
+            HandleVulkanFrame(bgra, w, h, stride);
+        });
     if (! m_render->init(info)) {
         outError = "Failed to initialize headless Vulkan device";
         return false;
@@ -306,6 +356,8 @@ bool RendererEngine::RebuildSceneFromCachedSource(std::string& outError) {
     }
     pVfs->Mount("/assets", wallpaper::fs::CreatePhysicalFs(m_lastReq.dir), "dir");
 
+    if (m_scripts) m_scripts->Reset();
+    if (m_text) m_text->Clear();
     if (m_rg) {
         m_render->clearLastRenderGraph();
         m_rg.reset();
@@ -313,6 +365,7 @@ bool RendererEngine::RebuildSceneFromCachedSource(std::string& outError) {
     m_scene.reset();
 
     std::string effectiveSrc = ApplyUserPropsToSceneSource(m_rawSceneSrc, m_userPropsJson);
+    m_lastEffectiveSceneSrc  = effectiveSrc;
     m_scene                  = m_parser->Parse(m_sceneId, effectiveSrc, *pVfs, *m_sound);
     if (! m_scene) {
         outError = "WPSceneParser failed to parse scene";
@@ -328,6 +381,13 @@ bool RendererEngine::RebuildSceneFromCachedSource(std::string& outError) {
 
     m_render->compileRenderGraph(*m_scene, *m_rg);
     m_render->UpdateCameraFillMode(*m_scene, wallpaper::FillMode::ASPECTCROP);
+
+    if (m_text && m_scene->vfs) {
+        m_text->LoadFromSceneJson(effectiveSrc, *m_scene->vfs);
+    }
+    if (m_scripts && m_text) {
+        m_scripts->Load(effectiveSrc, m_userPropsJson, *m_scene, *m_text);
+    }
     return true;
 }
 
@@ -403,12 +463,15 @@ bool RendererEngine::Load(const LoadRequest& req, std::string& outError, std::st
 
         // ---- Native Video Wallpaper Path (Windows Media Foundation x64) ----
         if (wpType == "video") {
+            if (m_scripts) m_scripts->Reset();
+            if (m_text) m_text->Clear();
             if (m_rg) {
                 m_render->clearLastRenderGraph();
                 m_rg.reset();
             }
             m_scene.reset();
             m_rawSceneSrc.clear();
+            m_lastEffectiveSceneSrc.clear();
             m_pkgPathUtf8.clear();
             if (m_audio) m_audio->SetPaused(true);
 
@@ -592,6 +655,13 @@ bool RendererEngine::SetProperties(const std::string& propsJson, std::string& ou
         if (! m_loaded || m_isVideo || m_rawSceneSrc.empty()) {
             return true;
         }
+        std::string nextEffective = ApplyUserPropsToSceneSource(m_rawSceneSrc, m_userPropsJson);
+        if (nextEffective == m_lastEffectiveSceneSrc) {
+            if (m_scripts) {
+                m_scripts->ApplyUserProperties(propsJson);
+            }
+            return true;
+        }
         return RebuildSceneFromCachedSource(outError);
     } catch (const std::exception& ex) {
         outError = std::string("Failed to apply properties: ") + ex.what();
@@ -608,15 +678,25 @@ bool RendererEngine::RenderFrame(double deltaSec) {
 
     if (! m_scene || ! m_render || ! m_rg) return false;
     try {
-        if (m_audio && m_scene->shaderValueUpdater) {
-            auto* wpUpdater =
-                dynamic_cast<wallpaper::WPShaderValueUpdater*>(m_scene->shaderValueUpdater.get());
-            if (wpUpdater) {
-                AudioSpectrumData spec {};
-                m_audio->GetSpectrum(spec);
-                wpUpdater->SetAudioSpectrum(
-                    spec.left64, spec.right64, spec.left32, spec.right32, spec.left16, spec.right16);
+        AudioSpectrumData spec {};
+        if (m_audio) {
+            m_audio->GetSpectrum(spec);
+            if (m_scene->shaderValueUpdater) {
+                auto* wpUpdater =
+                    dynamic_cast<wallpaper::WPShaderValueUpdater*>(m_scene->shaderValueUpdater.get());
+                if (wpUpdater) {
+                    wpUpdater->SetAudioSpectrum(spec.left64,
+                                                spec.right64,
+                                                spec.left32,
+                                                spec.right32,
+                                                spec.left16,
+                                                spec.right16);
+                }
             }
+        }
+
+        if (m_scripts && m_scripts->ActiveScriptCount() > 0) {
+            m_scripts->Update(deltaSec, m_scene->elapsingTime, spec, *m_scene);
         }
 
         m_scene->shaderValueUpdater->FrameBegin();
@@ -637,6 +717,12 @@ bool RendererEngine::RenderFrame(double deltaSec) {
 void RendererEngine::Shutdown() {
     m_loaded  = false;
     m_isVideo = false;
+    if (m_scripts) {
+        m_scripts->Reset();
+    }
+    if (m_text) {
+        m_text->Clear();
+    }
     if (m_audio) {
         m_audio->Stop();
     }

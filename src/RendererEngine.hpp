@@ -29,6 +29,8 @@ namespace lcdfusion_wpe
 
 class VideoPlayerWin32;
 class WasapiAudioAnalyzer;
+class TextLayerRenderer;
+class SceneScriptEngine;
 
 struct LoadRequest {
     std::string dir;
@@ -72,6 +74,7 @@ public:
 private:
     bool InitVulkanIfNeeded(uint32_t width, uint32_t height, std::string& outError);
     bool RebuildSceneFromCachedSource(std::string& outError);
+    void HandleVulkanFrame(const uint8_t* bgra, uint32_t width, uint32_t height, uint32_t stride);
 
     std::unique_ptr<wallpaper::WPSceneParser>        m_parser;
     std::unique_ptr<wallpaper::audio::SoundManager>  m_sound;
@@ -81,10 +84,14 @@ private:
 
     std::unique_ptr<VideoPlayerWin32>    m_video;
     std::unique_ptr<WasapiAudioAnalyzer> m_audio;
+    std::unique_ptr<TextLayerRenderer>   m_text;
+    std::unique_ptr<SceneScriptEngine>   m_scripts;
+    std::vector<uint8_t>                 m_compositeBgra;
 
     LoadRequest m_lastReq {};
     std::string m_sceneId;
     std::string m_rawSceneSrc;
+    std::string m_lastEffectiveSceneSrc;
     std::string m_pkgPathUtf8;
     std::string m_userPropsJson { "{}" };
 

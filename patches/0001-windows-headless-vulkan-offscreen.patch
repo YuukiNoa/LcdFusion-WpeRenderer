@@ -172,6 +172,34 @@ index 7087094..c3b5104 100644
  
          // a_PositionVec4: start pos
          AssignVertexTimes({ data + offset, totle_size },
+diff --git a/src/Scene/include/Scene/SceneNode.h b/src/Scene/include/Scene/SceneNode.h
+index b0fad20..ed72573 100644
+--- a/src/Scene/include/Scene/SceneNode.h
++++ b/src/Scene/include/Scene/SceneNode.h
+@@ -38,9 +38,21 @@ public:
+     Eigen::Matrix4d GetLocalTrans() const;
+ 
+     const auto& Translate() const { return m_translate; }
++    const auto& Scale() const { return m_scale; }
+     const auto& Rotation() const { return m_rotation; }
+-    void        SetRotation(Eigen::Vector3f v) { m_rotation = v; }
+-    void        SetTranslate(Eigen::Vector3f v) { m_translate = v; }
++    const auto& Name() const { return m_name; }
++    void        SetRotation(Eigen::Vector3f v) {
++        m_rotation = v;
++        MarkTransDirty();
++    }
++    void SetTranslate(Eigen::Vector3f v) {
++        m_translate = v;
++        MarkTransDirty();
++    }
++    void SetScale(Eigen::Vector3f v) {
++        m_scale = v;
++        MarkTransDirty();
++    }
+ 
+     void CopyTrans(const SceneNode& node) {
+         m_translate = node.m_translate;
 diff --git a/src/SpecTexs.hpp b/src/SpecTexs.hpp
 index 3edbd82..b607893 100644
 --- a/src/SpecTexs.hpp
@@ -1615,10 +1643,40 @@ index 031fb74..506c275 100644
      bool inited() const;
  
 diff --git a/src/WPSceneParser.cpp b/src/WPSceneParser.cpp
-index 487c9f9..e8a0c5d 100644
+index 487c9f9..61b415f 100644
 --- a/src/WPSceneParser.cpp
 +++ b/src/WPSceneParser.cpp
-@@ -484,14 +484,17 @@ void ParseCamera(ParseContext& context, wpscene::WPSceneGeneral& general) {
+@@ -436,6 +436,29 @@ void LoadAlignment(SceneNode& node, std::string_view align, Vector2f size) {
+     node.SetTranslate(trans);
+ }
+ 
++void FillUniformAliases(WPShaderValueData& svData, const WPShaderInfo& info) {
++    auto addAlias = [&](const std::string& key, const std::string& glname) {
++        if (key.empty() || glname.empty()) return;
++        svData.uniformAliases[key] = glname;
++        std::string lower          = key;
++        for (char& c : lower) {
++            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
++        }
++        svData.uniformAliases[lower] = glname;
++    };
++    for (const auto& el : info.alias) {
++        addAlias(el.first, el.second);
++        if (el.second.size() > 2 && el.second[1] == '_') {
++            addAlias(el.second.substr(2), el.second);
++        }
++    }
++    for (const auto& el : info.svs) {
++        if (el.first.size() > 2 && el.first[1] == '_') {
++            addAlias(el.first.substr(2), el.first);
++        }
++    }
++}
++
+ void LoadConstvalue(SceneMaterial& material, const wpscene::WPMaterial& wpmat,
+                     const WPShaderInfo& info) {
+     // load glname from alias and load to constvalue
+@@ -484,14 +507,17 @@ void ParseCamera(ParseContext& context, wpscene::WPSceneGeneral& general) {
      scene.activeCamera->AttatchNode(context.global_camera_node);
      scene.sceneGraph->AppendChild(context.global_camera_node);
  
@@ -1638,7 +1696,45 @@ index 487c9f9..e8a0c5d 100644
      context.global_perspective_camera_node = std::make_shared<SceneNode>(cperori, cscale, cangle);
      scene.cameras["global_perspective"]->AttatchNode(context.global_perspective_camera_node);
      scene.sceneGraph->AppendChild(context.global_perspective_camera_node);
-@@ -1012,6 +1015,14 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
+@@ -590,7 +616,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
+     // wpimgobj.origin[1] = context.ortho_h - wpimgobj.origin[1];
+     auto spImgNode = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
+                                                  Vector3f(wpimgobj.scale.data()),
+-                                                 Vector3f(wpimgobj.angles.data()));
++                                                 Vector3f(wpimgobj.angles.data()),
++                                                 wpimgobj.name);
++    spImgNode->ID() = wpimgobj.id;
+     LoadAlignment(*spImgNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
+     spImgNode->ID() = wpimgobj.id;
+ 
+@@ -629,6 +657,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
+             return;
+         };
+         LoadConstvalue(material, wpimgobj.material, shaderInfo);
++        FillUniformAliases(svData, shaderInfo);
+     }
+ 
+     for (const auto& cs : wpimgobj.material.constantshadervalues) {
+@@ -864,6 +893,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj) {
+ 
+                 // load glname from alias and load to constvalue
+                 LoadConstvalue(material, wpmat, wpEffShaderInfo);
++                FillUniformAliases(svData, wpEffShaderInfo);
+                 auto spMesh = std::make_shared<SceneMesh>();
+                 {
+                     svData.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
+@@ -930,7 +960,9 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
+         p_particle_obj = &wppartobj.particleObj;
+         spNode         = std::make_shared<SceneNode>(Vector3f(wppartobj.origin.data()),
+                                              Vector3f(wppartobj.scale.data()),
+-                                             Vector3f(wppartobj.angles.data()));
++                                             Vector3f(wppartobj.angles.data()),
++                                             wppartobj.name);
++        spNode->ID()   = wppartobj.id;
+     }
+ 
+     wpscene::ParticleInstanceoverride override = wppartobj.instanceoverride;
+@@ -1012,6 +1044,14 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
              SetParticleMesh(mesh, particle_obj, mesh_maxcount, thick_format);
      }
  
@@ -1653,7 +1749,7 @@ index 487c9f9..e8a0c5d 100644
      auto particleSub = std::make_unique<ParticleSubSystem>(
          *context.scene->paritileSys,
          spMesh,
-@@ -1032,6 +1043,19 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
+@@ -1032,6 +1072,19 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
                  lifetime = (1.0f - (p.lifetime / p.init.lifetime)) * sequencemultiplier;
                  break;
              }
@@ -1864,7 +1960,7 @@ index 7c3eaec..72ee0a3 100644
          vulkan::ShaderCompOpt opt;
          opt.client_ver             = glslang::EShTargetVulkan_1_1;
 diff --git a/src/WPShaderValueUpdater.cpp b/src/WPShaderValueUpdater.cpp
-index 4a1025e..26c7fe8 100644
+index 4a1025e..66f440e 100644
 --- a/src/WPShaderValueUpdater.cpp
 +++ b/src/WPShaderValueUpdater.cpp
 @@ -72,6 +72,12 @@ void WPShaderValueUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp&
@@ -1880,7 +1976,7 @@ index 4a1025e..26c7fe8 100644
  
      std::accumulate(begin(info.texs), end(info.texs), 0, [&existsOp](uint index, auto& value) {
          value.has_resolution = existsOp(WE_GLTEX_RESOLUTION_NAMES[index]);
-@@ -235,6 +241,33 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
+@@ -235,6 +241,61 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
          updateOp(G_LP, lights);
          updateOp(G_LCP, lights_color);
      }
@@ -1891,7 +1987,35 @@ index 4a1025e..26c7fe8 100644
 +    if (info.has_AUDIO32R) updateOp(G_AUDIO_SPECTRUM_32_RIGHT, ShaderValue(m_audio32R));
 +    if (info.has_AUDIO64L) updateOp(G_AUDIO_SPECTRUM_64_LEFT, ShaderValue(m_audio64L));
 +    if (info.has_AUDIO64R) updateOp(G_AUDIO_SPECTRUM_64_RIGHT, ShaderValue(m_audio64R));
++
++    if (exists(m_nodeUniformOverrides, static_cast<void*>(pNode))) {
++        const auto& overrides = m_nodeUniformOverrides.at(static_cast<void*>(pNode));
++        const auto* aliases   = hasNodeData ? &m_nodeDataMap.at(pNode).uniformAliases : nullptr;
++        for (const auto& kv : overrides) {
++            updateOp(kv.first, kv.second);
++            if (aliases && ! aliases->empty()) {
++                auto it = aliases->find(kv.first);
++                if (it == aliases->end()) {
++                    std::string lower = kv.first;
++                    for (char& c : lower) {
++                        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
++                    }
++                    it = aliases->find(lower);
++                }
++                if (it != aliases->end() && it->second != kv.first) {
++                    updateOp(it->second, kv.second);
++                }
++            }
++        }
++    }
 +}
++
++void WPShaderValueUpdater::SetNodeUniformOverride(void* nodeAddr, const std::string& name,
++                                                  const ShaderValue& val) {
++    m_nodeUniformOverrides[nodeAddr][name] = val;
++}
++
++void WPShaderValueUpdater::ClearNodeUniformOverrides() { m_nodeUniformOverrides.clear(); }
 +
 +void WPShaderValueUpdater::SetAudioSpectrum(const std::array<float, 64>& left64,
 +                                            const std::array<float, 64>& right64,
@@ -1915,7 +2039,7 @@ index 4a1025e..26c7fe8 100644
  
  void WPShaderValueUpdater::SetNodeData(void* nodeAddr, const WPShaderValueData& data) {
 diff --git a/src/WPShaderValueUpdater.hpp b/src/WPShaderValueUpdater.hpp
-index 3d5729c..c165265 100644
+index 3d5729c..01c646b 100644
 --- a/src/WPShaderValueUpdater.hpp
 +++ b/src/WPShaderValueUpdater.hpp
 @@ -39,6 +39,13 @@ struct WPUniformInfo {
@@ -1932,10 +2056,23 @@ index 3d5729c..c165265 100644
      struct Tex {
          bool has_resolution { false };
          bool has_mipmap { false };
-@@ -79,6 +86,10 @@ public:
+@@ -52,6 +59,9 @@ struct WPShaderValueData {
+     std::vector<std::pair<usize, std::string>> renderTargets;
+ 
+     WPPuppetLayer puppet_layer;
++
++    // Maps Scene JSON constantshadervalues keys (and lowercase/unprefixed variants) to GLSL uniform names.
++    std::unordered_map<std::string, std::string> uniformAliases;
+ };
+ 
+ struct WPCameraParallax {
+@@ -79,6 +89,13 @@ public:
  
      void SetScreenSize(i32 w, i32 h) override { m_screen_size = { (float)w, (float)h }; }
  
++    void SetNodeUniformOverride(void* nodeAddr, const std::string& name, const ShaderValue& val);
++    void ClearNodeUniformOverrides();
++
 +    void SetAudioSpectrum(const std::array<float, 64>& left64, const std::array<float, 64>& right64,
 +                          const std::array<float, 32>& left32, const std::array<float, 32>& right32,
 +                          const std::array<float, 16>& left16, const std::array<float, 16>& right16);
@@ -1943,7 +2080,7 @@ index 3d5729c..c165265 100644
  private:
      Scene*               m_scene;
      WPCameraParallax     m_parallax;
-@@ -94,6 +105,14 @@ private:
+@@ -94,7 +111,16 @@ private:
  
      std::array<float, 2> m_screen_size { 1920, 1080 };
  
@@ -1957,7 +2094,9 @@ index 3d5729c..c165265 100644
 +
      Map<void*, WPShaderValueData> m_nodeDataMap;
      Map<void*, WPUniformInfo>     m_nodeUniformInfoMap;
++    Map<void*, Map<std::string, ShaderValue>> m_nodeUniformOverrides;
  };
+ } // namespace wallpaper
 diff --git a/src/WPTexImageParser.cpp b/src/WPTexImageParser.cpp
 index ec396e4..4c40869 100644
 --- a/src/WPTexImageParser.cpp
