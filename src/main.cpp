@@ -82,13 +82,75 @@ void EmitJson(const json& obj) {
     }
 }
 
-void EmitReady(uint32_t width, uint32_t height, const std::string& backend) {
-    EmitJson({
+void EmitReady(uint32_t width, uint32_t height, const std::string& backend,
+               const std::string& gpuName = {}) {
+    json obj = {
         { "event", "ready" },
         { "width", width },
         { "height", height },
         { "backend", backend.empty() ? "vulkan-x64" : backend },
-    });
+    };
+    if (! gpuName.empty()) {
+        obj["gpu"] = gpuName;
+    }
+    EmitJson(obj);
+}
+
+lcdfusion_wpe::GpuPreference ParseGpuFromJson(const json& msg) {
+    lcdfusion_wpe::GpuPreference pref {};
+    if (! msg.contains("gpu")) return pref;
+    const auto& g = msg["gpu"];
+    if (g.is_string()) {
+        return lcdfusion_wpe::ParseGpuPreferenceString(g.get<std::string>());
+    }
+    if (! g.is_object()) return pref;
+    if (g.contains("uuid") && g["uuid"].is_string()) {
+        pref.uuidHex = g["uuid"].get<std::string>();
+    }
+    if (g.contains("name") && g["name"].is_string()) {
+        pref.name = g["name"].get<std::string>();
+    }
+    if (g.contains("vendorId") && g["vendorId"].is_number()) {
+        pref.vendorId = g["vendorId"].get<uint32_t>();
+    }
+    if (g.contains("deviceId") && g["deviceId"].is_number()) {
+        pref.deviceId = g["deviceId"].get<uint32_t>();
+    }
+    if (g.contains("ordinal") && g["ordinal"].is_number_integer()) {
+        pref.ordinal = g["ordinal"].get<int32_t>();
+    }
+    bool hasLuidFlag = g.value("hasLuid", false);
+    if ((hasLuidFlag || g.contains("luidLow")) && g.contains("luidHigh") && g.contains("luidLow") &&
+        g["luidHigh"].is_number_integer() && g["luidLow"].is_number()) {
+        pref.hasLuid  = true;
+        pref.luidHigh = g["luidHigh"].get<int32_t>();
+        pref.luidLow  = g["luidLow"].get<uint32_t>();
+    }
+    return pref;
+}
+
+int RunListGpusMode() {
+    auto gpus = lcdfusion_wpe::EnumerateVulkanGpus();
+    json arr  = json::array();
+    for (const auto& g : gpus) {
+        arr.push_back({
+            { "name", g.name },
+            { "type", g.type },
+            { "vendorId", g.vendorId },
+            { "deviceId", g.deviceId },
+            { "ordinal", g.ordinal },
+            { "luidValid", g.luidValid },
+            { "luidHigh", g.luidHigh },
+            { "luidLow", g.luidLow },
+            { "uuid", g.uuidHex },
+            { "vramMb", g.vramBytes / (1024ULL * 1024ULL) },
+            { "compatible", g.vulkanCompatible },
+        });
+    }
+    std::string out = arr.dump(2) + "\n";
+    std::fwrite(out.data(), 1, out.size(), stdout);
+    std::fflush(stdout);
+    return 0;
 }
 
 void EmitStatus(const std::string& state) {
@@ -142,6 +204,8 @@ int RunDumpMode(int argc, char** argv) {
             sensorsJson = nextVal();
         else if (arg == "--fit")
             req.fitMode = nextVal();
+        else if (arg == "--gpu")
+            req.gpu = lcdfusion_wpe::ParseGpuPreferenceString(nextVal());
         else if (arg == "--test-audio")
             testAudio = true;
         else if (arg == "--width")
@@ -397,6 +461,7 @@ int RunIpcMode(const std::string& pipeBaseName) {
                 req.height  = ClampDim(msg.value("height", 480), 480);
                 req.fps     = ClampFps(msg.value("fps", 30), 30);
                 req.fitMode = msg.value("fit", "fill");
+                req.gpu     = ParseGpuFromJson(msg);
                 if (msg.contains("props") && msg["props"].is_object()) {
                     req.initialPropsJson = msg["props"].dump();
                 }
@@ -422,7 +487,7 @@ int RunIpcMode(const std::string& pipeBaseName) {
 
                 // Render initial frame immediately so host has valid pixels right after ready
                 engine.RenderFrame(1.0 / static_cast<double>(targetFps));
-                EmitReady(req.width, req.height, engine.BackendName());
+                EmitReady(req.width, req.height, engine.BackendName(), engine.ActiveGpuName());
             } else if (cmd == "resize") {
                 uint32_t    newW    = ClampDim(msg.value("width", static_cast<int>(engine.Width())), 480);
                 uint32_t    newH    = ClampDim(msg.value("height", static_cast<int>(engine.Height())), 480);
@@ -439,6 +504,7 @@ int RunIpcMode(const std::string& pipeBaseName) {
                     }
                 }
                 if (engine.IsLoaded()) {
+                    engine.SetTargetFps(targetFps);
                     if (! newFit.empty()) {
                         engine.SetFitMode(newFit);
                     }
@@ -455,7 +521,7 @@ int RunIpcMode(const std::string& pipeBaseName) {
                 }
                 lastFrame = std::chrono::steady_clock::now();
                 nextFrame = lastFrame;
-                EmitReady(newW, newH, engine.BackendName());
+                EmitReady(newW, newH, engine.BackendName(), engine.ActiveGpuName());
             } else if (cmd == "pause") {
                 bool val = msg.value("value", false);
                 paused   = val;
@@ -535,6 +601,7 @@ int main(int argc, char** argv) {
     _setmode(_fileno(stderr), _O_BINARY);
 
     bool        ipcMode      = false;
+    bool        listGpusMode = false;
     std::string ipcPipeBase;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--ipc") == 0) {
@@ -542,9 +609,14 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--ipc-pipe") == 0 && i + 1 < argc) {
             ipcMode     = true;
             ipcPipeBase = argv[++i];
+        } else if (std::strcmp(argv[i], "--list-gpus") == 0) {
+            listGpusMode = true;
         }
     }
 
+    if (listGpusMode) {
+        return RunListGpusMode();
+    }
     if (ipcMode) {
         return RunIpcMode(ipcPipeBase);
     }

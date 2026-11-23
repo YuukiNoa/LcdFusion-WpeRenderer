@@ -364,16 +364,31 @@ void RendererEngine::InjectTestAudioTone(float frequencyHz, float amplitude) {
 }
 
 bool RendererEngine::InitVulkanIfNeeded(uint32_t width, uint32_t height, std::string& outError) {
+    GpuDeviceInfo chosenGpu {};
+    bool          hasChosenGpu = ResolvePreferredVulkanGpu(m_lastReq.gpu, chosenGpu);
+
     if (m_render->inited()) {
-        if (m_width != width || m_height != height) {
-            if (! m_render->resizeOffscreen(width, height)) {
-                outError = "Vulkan offscreen resize failed";
-                return false;
+        bool gpuChanged = hasChosenGpu && (! m_hasActiveVulkanUuid || m_activeVulkanUuid != chosenGpu.uuid);
+        if (! gpuChanged) {
+            if (m_width != width || m_height != height) {
+                if (! m_render->resizeOffscreen(width, height)) {
+                    outError = "Vulkan offscreen resize failed";
+                    return false;
+                }
+                m_width  = width;
+                m_height = height;
             }
-            m_width  = width;
-            m_height = height;
+            return true;
         }
-        return true;
+        // Recreate Vulkan renderer on newly selected GPU
+        if (m_rg) {
+            m_render->clearLastRenderGraph();
+            m_rg.reset();
+        }
+        m_scene.reset();
+        m_render->destroy();
+        m_render = std::make_unique<wallpaper::vulkan::VulkanRender>();
+        m_hasActiveVulkanUuid = false;
     }
 
     wallpaper::RenderInitInfo info {};
@@ -382,6 +397,9 @@ bool RendererEngine::InitVulkanIfNeeded(uint32_t width, uint32_t height, std::st
     info.offscreen_tiling   = wallpaper::TexTiling::OPTIMAL;
     info.width              = static_cast<uint16_t>(std::clamp<uint32_t>(width, 64, 4096));
     info.height             = static_cast<uint16_t>(std::clamp<uint32_t>(height, 64, 4096));
+    if (hasChosenGpu) {
+        info.uuid = std::span<const std::uint8_t>(chosenGpu.uuid.data(), chosenGpu.uuid.size());
+    }
 
     m_render->setFrameCallback(
         [this](const uint8_t* bgra, uint32_t w, uint32_t h, uint32_t stride) {
@@ -390,6 +408,21 @@ bool RendererEngine::InitVulkanIfNeeded(uint32_t width, uint32_t height, std::st
     if (! m_render->init(info)) {
         outError = "Failed to initialize headless Vulkan device";
         return false;
+    }
+
+    if (hasChosenGpu) {
+        m_activeVulkanUuid    = chosenGpu.uuid;
+        m_hasActiveVulkanUuid = true;
+        m_activeGpuName       = chosenGpu.name;
+        if (chosenGpu.luidValid) {
+            m_hasActiveLuid  = true;
+            m_activeLuidHigh = chosenGpu.luidHigh;
+            m_activeLuidLow  = chosenGpu.luidLow;
+        }
+        LOG_INFO("RendererEngine selected Vulkan GPU: %s (vendor=0x%04X device=0x%04X)",
+                 chosenGpu.name.c_str(),
+                 chosenGpu.vendorId,
+                 chosenGpu.deviceId);
     }
 
     m_width  = width;
@@ -420,6 +453,11 @@ void RendererEngine::SetFitMode(const std::string& fitMode) {
     } else if (m_scene && m_render) {
         m_render->UpdateCameraFillMode(*m_scene, ToWallpaperFillMode(m_fitMode));
     }
+}
+
+void RendererEngine::SetTargetFps(uint32_t fps) {
+    m_targetFps = std::clamp<uint32_t>(fps, 1u, 60u);
+    if (m_web) m_web->SetTargetFps(m_targetFps);
 }
 
 bool RendererEngine::RebuildSceneFromCachedSource(std::string& outError) {
@@ -488,11 +526,24 @@ bool RendererEngine::RebuildSceneFromCachedSource(std::string& outError) {
             SceneVideoTexture vt {};
             vt.texKey   = texKey;
             vt.tempFile = tmpPath;
-            vt.width    = static_cast<uint32_t>(std::max<int32_t>(2, targetW));
-            vt.height   = static_cast<uint32_t>(std::max<int32_t>(2, targetH));
+            int32_t cappedW = std::max<int32_t>(2, targetW);
+            int32_t cappedH = std::max<int32_t>(2, targetH);
+            const int32_t maxEdge =
+                static_cast<int32_t>(std::clamp<uint32_t>(std::max(m_width, m_height), 480u, 1280u));
+            if (cappedW > maxEdge || cappedH > maxEdge) {
+                double s = static_cast<double>(maxEdge) /
+                           static_cast<double>(std::max(cappedW, cappedH));
+                cappedW = std::max<int32_t>(2, static_cast<int32_t>(std::lround(cappedW * s)) & ~1);
+                cappedH = std::max<int32_t>(2, static_cast<int32_t>(std::lround(cappedH * s)) & ~1);
+            }
+            vt.width    = static_cast<uint32_t>(cappedW);
+            vt.height   = static_cast<uint32_t>(cappedH);
             vt.player   = std::make_unique<VideoPlayerWin32>();
             vt.player->SetFitMode(2);      // exact stretch to aspect-matched targetW x targetH
             vt.player->SetOutputRgba(true); // RGBA8 for Vulkan texture upload
+            if (m_hasActiveLuid && ! m_lastReq.gpu.IsAuto()) {
+                vt.player->SetGpuAdapterLuid(true, m_activeLuidHigh, m_activeLuidLow);
+            }
 
             std::vector<uint8_t> firstFrame;
             vt.player->SetFrameConsumer(
@@ -647,6 +698,23 @@ bool RendererEngine::Load(const LoadRequest& req, std::string& outError, std::st
         m_lastReq       = req;
         m_userPropsJson = mergedProps.dump();
         m_fitMode       = ParseFitModeInt(req.fitMode);
+        m_targetFps     = std::clamp<uint32_t>(req.fps, 1u, 60u);
+        m_activeGpuName.clear();
+        m_hasActiveLuid  = false;
+        m_activeLuidHigh = 0;
+        m_activeLuidLow  = 0;
+
+        int32_t     dxgiLuidHigh = 0;
+        uint32_t    dxgiLuidLow  = 0;
+        std::string dxgiGpuName;
+        bool        hasPreferredDxgi =
+            ResolvePreferredDxgiAdapterLuid(req.gpu, dxgiLuidHigh, dxgiLuidLow, dxgiGpuName);
+        if (hasPreferredDxgi) {
+            m_hasActiveLuid  = true;
+            m_activeLuidHigh = dxgiLuidHigh;
+            m_activeLuidLow  = dxgiLuidLow;
+            m_activeGpuName  = dxgiGpuName;
+        }
 
         // ---- Native Video Wallpaper Path (Windows Media Foundation x64) ----
         if (wpType == "video") {
@@ -674,6 +742,7 @@ bool RendererEngine::Load(const LoadRequest& req, std::string& outError, std::st
             m_video->SetFrameConsumer(m_frameConsumer);
             m_video->SetFitMode(m_fitMode);
             m_video->SetOutputRgba(false);
+            m_video->SetGpuAdapterLuid(hasPreferredDxgi, dxgiLuidHigh, dxgiLuidLow);
             std::string videoUtf8 = wallpaper::fs::FsPathToUtf8(videoPath);
             if (! m_video->Open(videoUtf8, req.width, req.height, outError)) {
                 outCode = "VIDEO_OPEN_FAILED";
@@ -718,6 +787,8 @@ bool RendererEngine::Load(const LoadRequest& req, std::string& outError, std::st
 
             m_web->SetFrameConsumer(m_frameConsumer);
             m_web->SetFitMode(m_fitMode);
+            m_web->SetTargetFps(m_targetFps);
+            m_web->SetGpuAdapterLuid(hasPreferredDxgi, dxgiLuidHigh, dxgiLuidLow);
             if (! m_web->Open(req.dir, webEntry, req.width, req.height, m_userPropsJson, outError, outCode)) {
                 return false;
             }

@@ -191,6 +191,7 @@ target_compile_options(qjs-static PRIVATE
 # Standalone offscreen renderer executable (x64)
 add_executable(wpe-renderer
     src/AudioSpectrumWin32.cpp
+    src/GpuSelectWin32.cpp
     src/VideoPlayerWin32.cpp
     src/WebWallpaperWin32.cpp
     src/TextLayerRenderer.cpp

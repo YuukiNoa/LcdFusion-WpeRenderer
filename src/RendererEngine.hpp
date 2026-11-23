@@ -1,5 +1,8 @@
 #pragma once
 
+#include "GpuSelectWin32.hpp"
+
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -34,14 +37,15 @@ class TextLayerRenderer;
 class SceneScriptEngine;
 
 struct LoadRequest {
-    std::string dir;
-    std::string assets;
-    std::string shmName;
-    std::string initialPropsJson;
-    std::string fitMode { "fill" };
-    uint32_t    width { 480 };
-    uint32_t    height { 480 };
-    uint32_t    fps { 30 };
+    std::string   dir;
+    std::string   assets;
+    std::string   shmName;
+    std::string   initialPropsJson;
+    std::string   fitMode { "fill" };
+    GpuPreference gpu {};
+    uint32_t      width { 480 };
+    uint32_t      height { 480 };
+    uint32_t      fps { 30 };
 };
 
 class RendererEngine {
@@ -60,6 +64,7 @@ public:
     bool Load(const LoadRequest& req, std::string& outError, std::string& outCode);
     bool Resize(uint32_t width, uint32_t height, std::string& outError);
     void SetFitMode(const std::string& fitMode);
+    void SetTargetFps(uint32_t fps);
     bool SetProperties(const std::string& propsJson, std::string& outError);
     void SetSensors(const std::string& sensorsJson);
     void SetPaused(bool paused);
@@ -77,6 +82,7 @@ public:
         if (m_isVideo) return "mf-video-x64";
         return "vulkan-x64";
     }
+    std::string ActiveGpuName() const { return m_activeGpuName; }
     uint32_t    Width() const { return m_width; }
     uint32_t    Height() const { return m_height; }
 
@@ -115,9 +121,15 @@ private:
     std::string m_rawSceneSrc;
     std::string m_lastEffectiveSceneSrc;
     std::string m_pkgPathUtf8;
-    std::string m_userPropsJson { "{}" };
-    std::string m_lastSensorsJson;
-    int         m_fitMode { 0 }; // 0 = fill, 1 = fit, 2 = stretch
+    std::string             m_userPropsJson { "{}" };
+    std::string             m_lastSensorsJson;
+    std::string             m_activeGpuName;
+    std::array<uint8_t, 16> m_activeVulkanUuid {};
+    bool                    m_hasActiveVulkanUuid { false };
+    bool                    m_hasActiveLuid { false };
+    int32_t                 m_activeLuidHigh { 0 };
+    uint32_t                m_activeLuidLow { 0 };
+    int                     m_fitMode { 0 }; // 0 = fill, 1 = fit, 2 = stretch
 
     FrameConsumer m_frameConsumer;
     bool          m_loaded { false };
@@ -126,6 +138,7 @@ private:
     bool          m_paused { false };
     uint32_t      m_width { 0 };
     uint32_t      m_height { 0 };
+    uint32_t      m_targetFps { 30 };
 };
 
 } // namespace lcdfusion_wpe

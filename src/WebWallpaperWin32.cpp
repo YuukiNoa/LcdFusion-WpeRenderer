@@ -66,7 +66,8 @@ constexpr UINT WM_WPE_PAUSED     = WM_APP + 3;
 constexpr UINT WM_WPE_AUDIO      = WM_APP + 4;
 constexpr UINT WM_WPE_CLOSE      = WM_APP + 5;
 constexpr UINT WM_WPE_POLL_FALLBACK = WM_APP + 6;
-constexpr UINT WM_WPE_SENSORS    = WM_APP + 7;
+constexpr UINT WM_WPE_SENSORS       = WM_APP + 7;
+constexpr UINT WM_WPE_FPS           = WM_APP + 8;
 
 std::wstring Utf8ToWide(const std::string& s) {
     if (s.empty()) return {};
@@ -260,6 +261,7 @@ constexpr const wchar_t* kWebWallpaperBridgeScript = LR"JS(
     let _propsMap = Object.create(null);
     let _initialFlushed = false;
     let _pendingTimer = 0;
+    let _targetFps = 30;
 
     function wrapProps(raw) {
         const out = {};
@@ -290,7 +292,7 @@ constexpr const wchar_t* kWebWallpaperBridgeScript = LR"JS(
             _initialFlushed = true;
             flushToListener(null);
             if (typeof _listener.applyGeneralProperties === 'function') {
-                try { _listener.applyGeneralProperties({ fps: 30 }); } catch (e) {}
+                try { _listener.applyGeneralProperties({ fps: _targetFps }); } catch (e) {}
             }
         }, 20);
     }
@@ -327,6 +329,15 @@ constexpr const wchar_t* kWebWallpaperBridgeScript = LR"JS(
     window.__wpeSetPaused = function(paused) {
         if (_listener && typeof _listener.setPaused === 'function') {
             try { _listener.setPaused(!!paused); } catch (e) {}
+        }
+    };
+
+    window.__wpeSetFps = function(fps) {
+        if (typeof fps === 'number' && fps >= 1) {
+            _targetFps = Math.round(fps);
+            if (_listener && typeof _listener.applyGeneralProperties === 'function') {
+                try { _listener.applyGeneralProperties({ fps: _targetFps }); } catch (e) {}
+            }
         }
     };
 
@@ -620,7 +631,11 @@ struct WebWallpaperWin32::Impl {
     std::atomic<int>      fitMode { 0 };
     std::atomic<uint32_t> width { 480 };
     std::atomic<uint32_t> height { 480 };
+    std::atomic<uint32_t> targetFps { 30 };
     std::atomic<DWORD>    workerThreadId { 0 };
+    bool                  useAdapterLuid { false };
+    int32_t               adapterLuidHigh { 0 };
+    uint32_t              adapterLuidLow { 0 };
 
     void ComputeViewportSize(uint32_t& vpW, uint32_t& vpH) const {
         uint32_t outW = width.load();
@@ -630,10 +645,14 @@ struct WebWallpaperWin32::Impl {
             vpW = outW;
             vpH = outH;
         } else {
-            // 16:9 logical viewport for Fit (letterbox) & Stretch (full-canvas deform)
-            uint32_t baseW = std::clamp<uint32_t>(std::max<uint32_t>(outW, static_cast<uint32_t>(std::lround(outH * 16.0 / 9.0))), 640, 1280);
-            vpW            = baseW;
-            vpH            = std::max<uint32_t>(360, static_cast<uint32_t>(std::lround(baseW * 9.0 / 16.0)));
+            // 16:9 logical viewport for Fit (letterbox) & Stretch (full-canvas deform),
+            // respecting low render-scale targets instead of forcing 640x360.
+            uint32_t baseW = std::clamp<uint32_t>(
+                std::max<uint32_t>(outW, static_cast<uint32_t>(std::lround(outH * 16.0 / 9.0))),
+                240,
+                1280);
+            vpW = baseW;
+            vpH = std::max<uint32_t>(136, static_cast<uint32_t>(std::lround(baseW * 9.0 / 16.0)));
         }
     }
 
@@ -669,6 +688,9 @@ struct WebWallpaperWin32::Impl {
     std::wstring                              wallpaperDirWide;
     std::wstring                              entryUrlWide;
     std::chrono::steady_clock::time_point     lastScreencastFrameTime {};
+    std::chrono::steady_clock::time_point     lastAckSentTime {};
+    bool                                      pendingAck { false };
+    int                                       pendingAckSessionId { 0 };
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_CREATE) {
@@ -695,12 +717,19 @@ struct WebWallpaperWin32::Impl {
         case WM_WPE_SENSORS:
             self->OnStaPushSensors();
             return 0;
+        case WM_WPE_FPS:
+            self->OnStaSetFps(static_cast<uint32_t>(wp));
+            return 0;
         case WM_WPE_CLOSE:
             self->OnStaCleanupAndQuit();
             return 0;
         case WM_TIMER:
             if (wp == 1) {
                 self->OnStaFallbackCaptureTick();
+                return 0;
+            }
+            if (wp == 2) {
+                self->OnStaScreencastAckTimer();
                 return 0;
             }
             break;
@@ -775,6 +804,8 @@ struct WebWallpaperWin32::Impl {
     }
 
     void StopScreencast() {
+        if (hwnd) KillTimer(hwnd, 2);
+        pendingAck = false;
         if (! webView || ! screencastActive) return;
         auto* cb = new ComHandler<ICoreWebView2CallDevToolsProtocolMethodCompletedHandler,
                                   &kIidCdpMethod, HRESULT, LPCWSTR>(
@@ -782,6 +813,37 @@ struct WebWallpaperWin32::Impl {
         webView->CallDevToolsProtocolMethod(L"Page.stopScreencast", L"{}", cb);
         cb->Release();
         screencastActive = false;
+    }
+
+    void SendScreencastAckNow(int sessionId) {
+        if (! webView || closing.load()) return;
+        lastAckSentTime        = std::chrono::steady_clock::now();
+        std::wstring ackParams = L"{\"sessionId\":" + std::to_wstring(sessionId) + L"}";
+        auto*        ackCb     = new ComHandler<ICoreWebView2CallDevToolsProtocolMethodCompletedHandler,
+                                        &kIidCdpMethod, HRESULT, LPCWSTR>(
+            [](HRESULT, LPCWSTR) -> HRESULT { return S_OK; });
+        webView->CallDevToolsProtocolMethod(L"Page.screencastFrameAck", ackParams.c_str(), ackCb);
+        ackCb->Release();
+    }
+
+    void OnStaScreencastAckTimer() {
+        if (hwnd) KillTimer(hwnd, 2);
+        if (! pendingAck || closing.load() || paused.load()) {
+            pendingAck = false;
+            return;
+        }
+        int sid    = pendingAckSessionId;
+        pendingAck = false;
+        SendScreencastAckNow(sid);
+    }
+
+    void OnStaSetFps(uint32_t fps) {
+        uint32_t clamped = std::clamp<uint32_t>(fps, 1u, 60u);
+        targetFps.store(clamped);
+        if (webView) {
+            std::wstring script = L"if(window.__wpeSetFps){window.__wpeSetFps(" + std::to_wstring(clamped) + L");}";
+            webView->ExecuteScript(script.c_str(), nullptr);
+        }
     }
 
     void TriggerCapturePreviewFallback() {
@@ -838,18 +900,10 @@ struct WebWallpaperWin32::Impl {
     void OnScreencastFrame(LPCWSTR jsonWide) {
         if (! jsonWide || closing.load()) return;
         try {
-            auto j = nlohmann::json::parse(WideToUtf8(jsonWide));
-            if (j.contains("sessionId")) {
-                int sessionId = j["sessionId"].get<int>();
-                std::wstring ackParams = L"{\"sessionId\":" + std::to_wstring(sessionId) + L"}";
-                auto*        ackCb     = new ComHandler<ICoreWebView2CallDevToolsProtocolMethodCompletedHandler,
-                                                &kIidCdpMethod, HRESULT, LPCWSTR>(
-                    [](HRESULT, LPCWSTR) -> HRESULT { return S_OK; });
-                if (webView) {
-                    webView->CallDevToolsProtocolMethod(L"Page.screencastFrameAck", ackParams.c_str(), ackCb);
-                }
-                ackCb->Release();
-            }
+            auto j          = nlohmann::json::parse(WideToUtf8(jsonWide));
+            bool hasSession = j.contains("sessionId");
+            int  sessionId  = hasSession ? j["sessionId"].get<int>() : 0;
+
             if (j.contains("data") && j["data"].is_string()) {
                 auto encoded = Base64Decode(j["data"].get_ref<const std::string&>());
                 if (! encoded.empty()) {
@@ -861,6 +915,27 @@ struct WebWallpaperWin32::Impl {
                         StoreDecodedRgba(rgba, static_cast<uint32_t>(w), static_cast<uint32_t>(h));
                         stbi_image_free(rgba);
                     }
+                }
+            }
+
+            if (hasSession && webView && ! paused.load()) {
+                // Pace CDP Page.screencastFrameAck to targetFps so Chromium does not encode/readback
+                // at 60/144Hz when the LCD only needs 10-30fps.
+                const uint32_t fps = std::clamp<uint32_t>(targetFps.load(), 1u, 60u);
+                const int64_t  minPeriodMs = std::max<int64_t>(16, 1000 / static_cast<int64_t>(fps));
+                auto           now         = std::chrono::steady_clock::now();
+                int64_t        elapsedMs   = (lastAckSentTime.time_since_epoch().count() == 0)
+                                                 ? minPeriodMs
+                                                 : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                       now - lastAckSentTime)
+                                                       .count();
+                if (elapsedMs >= minPeriodMs || ! hwnd) {
+                    SendScreencastAckNow(sessionId);
+                } else {
+                    UINT delayMs        = static_cast<UINT>(std::max<int64_t>(1, minPeriodMs - elapsedMs));
+                    pendingAckSessionId = sessionId;
+                    pendingAck          = true;
+                    SetTimer(hwnd, 2, delayMs, nullptr);
                 }
             }
         } catch (const std::exception& ex) {
@@ -983,7 +1058,10 @@ struct WebWallpaperWin32::Impl {
     }
 
     void OnStaCleanupAndQuit() {
-        if (hwnd) KillTimer(hwnd, 1);
+        if (hwnd) {
+            KillTimer(hwnd, 1);
+            KillTimer(hwnd, 2);
+        }
         StopScreencast();
         if (screencastReceiver) {
             screencastReceiver->remove_DevToolsProtocolEventReceived(screencastToken);
@@ -1074,6 +1152,7 @@ struct WebWallpaperWin32::Impl {
 
         // Inject Wallpaper Engine Web API shim + initial properties before document scripts execute
         std::wstring initScript = kWebWallpaperBridgeScript;
+        initScript += L"\nwindow.__wpeSetFps(" + std::to_wstring(targetFps.load()) + L");\n";
         if (! initialPropsJson.empty() && initialPropsJson != "{}") {
             initScript += L"\nwindow.__wpeApplyProps(" + Utf8ToWide(initialPropsJson) + L");\n";
         }
@@ -1217,13 +1296,18 @@ struct WebWallpaperWin32::Impl {
         std::error_code ec;
         std::filesystem::create_directories(userDataDir, ec);
 
-        auto* envOpts = new SimpleEnvOptions(
+        std::wstring browserArgs =
             L"--force-device-scale-factor=1 "
             L"--autoplay-policy=no-user-gesture-required "
             L"--disable-background-timer-throttling "
             L"--disable-renderer-backgrounding "
             L"--disable-backgrounding-occluded-windows "
-            L"--mute-audio");
+            L"--mute-audio";
+        if (useAdapterLuid) {
+            browserArgs += L" --use-adapter-luid=" + std::to_wstring(adapterLuidHigh) +
+                           L"," + std::to_wstring(adapterLuidLow);
+        }
+        auto* envOpts = new SimpleEnvOptions(browserArgs);
 
         auto* envHandler = new ComHandler<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
                                           &kIidEnvCompleted, HRESULT, ICoreWebView2Environment*>(
@@ -1352,6 +1436,21 @@ void WebWallpaperWin32::SetFitMode(int fitMode) {
                      static_cast<WPARAM>(m_impl->width.load()),
                      static_cast<LPARAM>(m_impl->height.load()));
     }
+}
+
+void WebWallpaperWin32::SetTargetFps(uint32_t fps) {
+    if (! m_impl) return;
+    uint32_t clamped = std::clamp<uint32_t>(fps, 1u, 60u);
+    if (m_impl->targetFps.exchange(clamped) != clamped && m_impl->open.load() && m_impl->hwnd) {
+        PostMessageW(m_impl->hwnd, WM_WPE_FPS, static_cast<WPARAM>(clamped), 0);
+    }
+}
+
+void WebWallpaperWin32::SetGpuAdapterLuid(bool enabled, int32_t highPart, uint32_t lowPart) {
+    if (! m_impl) return;
+    m_impl->useAdapterLuid  = enabled;
+    m_impl->adapterLuidHigh = highPart;
+    m_impl->adapterLuidLow  = lowPart;
 }
 
 bool WebWallpaperWin32::IsOpen() const { return m_impl && m_impl->open.load(); }

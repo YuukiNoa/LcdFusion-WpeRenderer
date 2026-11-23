@@ -29,6 +29,10 @@ public:
     void SetFrameConsumer(FrameConsumer consumer);
     // 0 = Fill (native viewport), 1 = Fit (16:9 letterbox), 2 = Stretch (16:9 stretched to output)
     void SetFitMode(int fitMode);
+    // Target FPS used to pace CDP Page.screencastFrameAck and notify Wallpaper Engine Web API.
+    void SetTargetFps(uint32_t fps);
+    // Optional: pin Chromium/WebView2 rendering to a specific Windows GPU adapter LUID.
+    void SetGpuAdapterLuid(bool enabled, int32_t highPart, uint32_t lowPart);
 
     bool Open(const std::string& wallpaperDirUtf8, const std::string& entryFileUtf8,
               uint32_t width, uint32_t height, const std::string& initialPropsJson,
