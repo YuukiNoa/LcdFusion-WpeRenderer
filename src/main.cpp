@@ -122,6 +122,7 @@ int RunDumpMode(int argc, char** argv) {
     req.height = 480;
     req.fps    = 30;
     std::string dumpPath = "dump.png";
+    std::string sensorsJson;
     int         frames   = 10;
     bool        testAudio = false;
 
@@ -137,6 +138,10 @@ int RunDumpMode(int argc, char** argv) {
             req.assets = nextVal();
         else if (arg == "--props")
             req.initialPropsJson = nextVal();
+        else if (arg == "--sensors")
+            sensorsJson = nextVal();
+        else if (arg == "--fit")
+            req.fitMode = nextVal();
         else if (arg == "--test-audio")
             testAudio = true;
         else if (arg == "--width")
@@ -178,6 +183,9 @@ int RunDumpMode(int argc, char** argv) {
         std::fprintf(stderr, "Load failed [%s]: %s\n", code.c_str(), err.c_str());
         return 1;
     }
+    if (! sensorsJson.empty()) {
+        engine.SetSensors(sensorsJson);
+    }
     if (testAudio) {
         engine.SetPaused(true);
         engine.InjectTestAudioTone(220.0f, 1.0f);
@@ -191,6 +199,9 @@ int RunDumpMode(int argc, char** argv) {
         if (! engine.RenderFrame(1.0 / 30.0)) {
             std::fprintf(stderr, "RenderFrame failed at frame %d\n", f);
             return 1;
+        }
+        if (engine.IsWeb()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
         }
     }
     auto t1 = std::chrono::steady_clock::now();
@@ -308,6 +319,20 @@ int RunIpcMode(const std::string& pipeBaseName) {
         cmdCv.notify_one();
     });
 
+    // Request 1 ms timer granularity in IPC mode (via dynamic winmm lookup, zero extra import DLLs)
+    // so frame pacing and audio capture wake within ~1 ms instead of Windows' default 15.6 ms tick.
+    using TimePeriodFn = UINT(WINAPI*)(UINT);
+    HMODULE      hWinmm    = LoadLibraryW(L"winmm.dll");
+    TimePeriodFn fnEndPer  = nullptr;
+    bool         timerHigh = false;
+    if (hWinmm) {
+        auto fnBegin = reinterpret_cast<TimePeriodFn>(GetProcAddress(hWinmm, "timeBeginPeriod"));
+        fnEndPer     = reinterpret_cast<TimePeriodFn>(GetProcAddress(hWinmm, "timeEndPeriod"));
+        if (fnBegin && fnBegin(1) == 0) {
+            timerHigh = true;
+        }
+    }
+
     lcdfusion_wpe::RendererEngine engine;
     lcdfusion_wpe::ShmWriter      shm;
 
@@ -371,6 +396,7 @@ int RunIpcMode(const std::string& pipeBaseName) {
                 req.width   = ClampDim(msg.value("width", 480), 480);
                 req.height  = ClampDim(msg.value("height", 480), 480);
                 req.fps     = ClampFps(msg.value("fps", 30), 30);
+                req.fitMode = msg.value("fit", "fill");
                 if (msg.contains("props") && msg["props"].is_object()) {
                     req.initialPropsJson = msg["props"].dump();
                 }
@@ -402,6 +428,7 @@ int RunIpcMode(const std::string& pipeBaseName) {
                 uint32_t    newH    = ClampDim(msg.value("height", static_cast<int>(engine.Height())), 480);
                 uint32_t    newFps  = ClampFps(msg.value("fps", static_cast<int>(targetFps)), targetFps);
                 std::string newShm  = msg.value("shm", "");
+                std::string newFit  = msg.value("fit", "");
                 targetFps           = newFps;
 
                 std::string err;
@@ -412,6 +439,9 @@ int RunIpcMode(const std::string& pipeBaseName) {
                     }
                 }
                 if (engine.IsLoaded()) {
+                    if (! newFit.empty()) {
+                        engine.SetFitMode(newFit);
+                    }
                     if (! engine.Resize(newW, newH, err)) {
                         shm.SetState(lcdfusion_wpe::kShmStateError);
                         EmitError("RESIZE_FAILED", err);
@@ -449,6 +479,10 @@ int RunIpcMode(const std::string& pipeBaseName) {
                     }
                 }
                 EmitStatus("props_applied");
+            } else if (cmd == "sensors") {
+                if (msg.contains("data") && msg["data"].is_object()) {
+                    engine.SetSensors(msg["data"].dump());
+                }
             }
         }
 
@@ -472,6 +506,8 @@ int RunIpcMode(const std::string& pipeBaseName) {
 
     shm.Close();
     engine.Shutdown();
+    if (timerHigh && fnEndPer) fnEndPer(1);
+    if (hWinmm) FreeLibrary(hWinmm);
     {
         std::lock_guard<std::mutex> lock(g_stdoutMutex);
         if (g_pipeOut != INVALID_HANDLE_VALUE) {

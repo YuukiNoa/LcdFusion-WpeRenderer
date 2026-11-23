@@ -165,6 +165,18 @@ bool VideoPlayerWin32::Open(const std::string& videoPathUtf8, uint32_t outWidth,
     return true;
 }
 
+void VideoPlayerWin32::SetFitMode(int fitMode) {
+    int clamped = (fitMode == 1 || fitMode == 2) ? fitMode : 0;
+    if (m_fitMode == clamped) return;
+    m_fitMode = clamped;
+    if (m_reader && ! m_lastSrcBgra.empty() && m_lastSrcW > 0 && m_lastSrcH > 0) {
+        BlitToOutput(m_lastSrcBgra.data(), m_lastSrcW, m_lastSrcH, m_lastSrcStride);
+        if (m_consumer) {
+            m_consumer(m_outBgra.data(), m_outWidth, m_outHeight, m_outWidth * 4u);
+        }
+    }
+}
+
 bool VideoPlayerWin32::Resize(uint32_t outWidth, uint32_t outHeight) {
     if (! m_reader || outWidth == 0 || outHeight == 0) return false;
     m_outWidth  = outWidth;
@@ -173,7 +185,7 @@ bool VideoPlayerWin32::Resize(uint32_t outWidth, uint32_t outHeight) {
 
     // Re-scale last decoded frame immediately so resize produces crisp pixels right away.
     if (! m_lastSrcBgra.empty() && m_lastSrcW > 0 && m_lastSrcH > 0) {
-        BlitAspectCropToOutput(m_lastSrcBgra.data(), m_lastSrcW, m_lastSrcH, m_lastSrcStride);
+        BlitToOutput(m_lastSrcBgra.data(), m_lastSrcW, m_lastSrcH, m_lastSrcStride);
         if (m_consumer) {
             m_consumer(m_outBgra.data(), m_outWidth, m_outHeight, m_outWidth * 4u);
         }
@@ -192,8 +204,9 @@ bool VideoPlayerWin32::RenderFrame(double deltaSec) {
 
     m_accumSec += std::clamp(deltaSec, 0.0, 0.25);
     int decoded = 0;
-    // Catch up at most 2 video frames per render tick to stay responsive on high-fps 4K videos.
-    while (m_accumSec >= m_videoFrameDurationSec && decoded < 2) {
+    // Catch up at most 1 video frame per render tick for high-res textures (2 for standalone video).
+    const int maxCatchup = m_outputRgba ? 1 : 2;
+    while (m_accumSec >= m_videoFrameDurationSec && decoded < maxCatchup) {
         if (! DecodeNextFrame()) return false;
         m_accumSec -= m_videoFrameDurationSec;
         ++decoded;
@@ -276,11 +289,13 @@ bool VideoPlayerWin32::DecodeNextFrame() {
             const std::size_t absStride = static_cast<std::size_t>(std::abs(m_srcStride));
             const std::size_t needed    = absStride * m_srcHeight;
             if (curLen >= needed && m_srcWidth > 0 && m_srcHeight > 0) {
-                m_lastSrcW      = m_srcWidth;
-                m_lastSrcH      = m_srcHeight;
-                m_lastSrcStride = m_srcStride;
-                m_lastSrcBgra.assign(data, data + needed);
-                BlitAspectCropToOutput(data, m_srcWidth, m_srcHeight, m_srcStride);
+                if (! m_outputRgba) {
+                    m_lastSrcW      = m_srcWidth;
+                    m_lastSrcH      = m_srcHeight;
+                    m_lastSrcStride = m_srcStride;
+                    m_lastSrcBgra.assign(data, data + needed);
+                }
+                BlitToOutput(data, m_srcWidth, m_srcHeight, m_srcStride);
                 if (m_consumer) {
                     m_consumer(m_outBgra.data(), m_outWidth, m_outHeight, m_outWidth * 4u);
                 }
@@ -295,34 +310,53 @@ bool VideoPlayerWin32::DecodeNextFrame() {
     return false;
 }
 
-void VideoPlayerWin32::BlitAspectCropToOutput(const uint8_t* srcBgra, uint32_t srcW, uint32_t srcH,
-                                              int32_t srcStride) {
+void VideoPlayerWin32::BlitToOutput(const uint8_t* srcBgra, uint32_t srcW, uint32_t srcH,
+                                    int32_t srcStride) {
     if (m_outWidth == 0 || m_outHeight == 0 || srcW == 0 || srcH == 0) return;
     const bool        bottomUp  = (srcStride < 0);
     const std::size_t absStride = static_cast<std::size_t>(std::abs(srcStride));
 
-    // ASPECTCROP center-crop rectangle in source coordinates
     const double srcAspect = static_cast<double>(srcW) / static_cast<double>(srcH);
     const double dstAspect = static_cast<double>(m_outWidth) / static_cast<double>(m_outHeight);
 
-    double cropX = 0.0, cropY = 0.0;
-    double cropW = static_cast<double>(srcW);
-    double cropH = static_cast<double>(srcH);
-    if (srcAspect > dstAspect) {
-        cropW = static_cast<double>(srcH) * dstAspect;
-        cropX = (static_cast<double>(srcW) - cropW) * 0.5;
-    } else {
-        cropH = static_cast<double>(srcW) / dstAspect;
-        cropY = (static_cast<double>(srcH) - cropH) * 0.5;
-    }
+    double   cropX = 0.0, cropY = 0.0;
+    double   cropW = static_cast<double>(srcW);
+    double   cropH = static_cast<double>(srcH);
+    uint32_t dstX0 = 0, dstY0 = 0;
+    uint32_t dstW = m_outWidth, dstH = m_outHeight;
 
-    const double stepX = cropW / static_cast<double>(m_outWidth);
-    const double stepY = cropH / static_cast<double>(m_outHeight);
+    if (m_fitMode == 1) {
+        // Fit (letterbox / pillarbox with opaque black background)
+        std::memset(m_outBgra.data(), 0, m_outBgra.size());
+        for (std::size_t i = 3; i < m_outBgra.size(); i += 4) m_outBgra[i] = 0xFF;
+        if (srcAspect > dstAspect) {
+            dstH  = std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(m_outWidth / srcAspect)));
+            dstH  = std::min(dstH, m_outHeight);
+            dstY0 = (m_outHeight - dstH) / 2u;
+        } else {
+            dstW  = std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(m_outHeight * srcAspect)));
+            dstW  = std::min(dstW, m_outWidth);
+            dstX0 = (m_outWidth - dstW) / 2u;
+        }
+    } else if (m_fitMode == 0) {
+        // Fill (ASPECTCROP center-crop)
+        if (srcAspect > dstAspect) {
+            cropW = static_cast<double>(srcH) * dstAspect;
+            cropX = (static_cast<double>(srcW) - cropW) * 0.5;
+        } else {
+            cropH = static_cast<double>(srcW) / dstAspect;
+            cropY = (static_cast<double>(srcH) - cropH) * 0.5;
+        }
+    }
+    // m_fitMode == 2 (Stretch): full srcW x srcH -> full m_outWidth x m_outHeight
+
+    const double stepX = cropW / static_cast<double>(dstW);
+    const double stepY = cropH / static_cast<double>(dstH);
 
     // Precompute X lookup indices & bilinear weights
-    std::vector<uint32_t> x0Arr(m_outWidth), x1Arr(m_outWidth);
-    std::vector<uint32_t> wxArr(m_outWidth);
-    for (uint32_t dx = 0; dx < m_outWidth; ++dx) {
+    std::vector<uint32_t> x0Arr(dstW), x1Arr(dstW);
+    std::vector<uint32_t> wxArr(dstW);
+    for (uint32_t dx = 0; dx < dstW; ++dx) {
         double sx = cropX + (static_cast<double>(dx) + 0.5) * stepX - 0.5;
         sx        = std::clamp(sx, 0.0, static_cast<double>(srcW - 1));
         uint32_t i0 = static_cast<uint32_t>(sx);
@@ -332,7 +366,10 @@ void VideoPlayerWin32::BlitAspectCropToOutput(const uint8_t* srcBgra, uint32_t s
         wxArr[dx]   = static_cast<uint32_t>((sx - static_cast<double>(i0)) * 256.0);
     }
 
-    for (uint32_t dy = 0; dy < m_outHeight; ++dy) {
+    const int ch0 = m_outputRgba ? 2 : 0;
+    const int ch2 = m_outputRgba ? 0 : 2;
+
+    for (uint32_t dy = 0; dy < dstH; ++dy) {
         double sy = cropY + (static_cast<double>(dy) + 0.5) * stepY - 0.5;
         sy        = std::clamp(sy, 0.0, static_cast<double>(srcH - 1));
         uint32_t y0 = static_cast<uint32_t>(sy);
@@ -344,9 +381,10 @@ void VideoPlayerWin32::BlitAspectCropToOutput(const uint8_t* srcBgra, uint32_t s
         uint32_t rowIdx1 = bottomUp ? (srcH - 1 - y1) : y1;
         const uint8_t* r0 = srcBgra + static_cast<std::size_t>(rowIdx0) * absStride;
         const uint8_t* r1 = srcBgra + static_cast<std::size_t>(rowIdx1) * absStride;
-        uint8_t*       dst = m_outBgra.data() + static_cast<std::size_t>(dy) * m_outWidth * 4u;
+        uint8_t*       dst = m_outBgra.data() +
+                       (static_cast<std::size_t>(dstY0 + dy) * m_outWidth + dstX0) * 4u;
 
-        for (uint32_t dx = 0; dx < m_outWidth; ++dx) {
+        for (uint32_t dx = 0; dx < dstW; ++dx) {
             uint32_t       ox0 = x0Arr[dx];
             uint32_t       ox1 = x1Arr[dx];
             uint32_t       wx  = wxArr[dx];
@@ -357,12 +395,12 @@ void VideoPlayerWin32::BlitAspectCropToOutput(const uint8_t* srcBgra, uint32_t s
             uint32_t w01 = iwx * wy;
             uint32_t w11 = wx * wy;
 
-            dst[dx * 4 + 0] = static_cast<uint8_t>((r0[ox0 + 0] * w00 + r0[ox1 + 0] * w10 +
-                                                    r1[ox0 + 0] * w01 + r1[ox1 + 0] * w11) >> 16);
+            dst[dx * 4 + 0] = static_cast<uint8_t>((r0[ox0 + ch0] * w00 + r0[ox1 + ch0] * w10 +
+                                                    r1[ox0 + ch0] * w01 + r1[ox1 + ch0] * w11) >> 16);
             dst[dx * 4 + 1] = static_cast<uint8_t>((r0[ox0 + 1] * w00 + r0[ox1 + 1] * w10 +
                                                     r1[ox0 + 1] * w01 + r1[ox1 + 1] * w11) >> 16);
-            dst[dx * 4 + 2] = static_cast<uint8_t>((r0[ox0 + 2] * w00 + r0[ox1 + 2] * w10 +
-                                                    r1[ox0 + 2] * w01 + r1[ox1 + 2] * w11) >> 16);
+            dst[dx * 4 + 2] = static_cast<uint8_t>((r0[ox0 + ch2] * w00 + r0[ox1 + ch2] * w10 +
+                                                    r1[ox0 + ch2] * w01 + r1[ox1 + ch2] * w11) >> 16);
             dst[dx * 4 + 3] = 0xFF;
         }
     }

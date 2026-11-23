@@ -24,6 +24,10 @@ public:
     VideoPlayerWin32& operator=(const VideoPlayerWin32&) = delete;
 
     void SetFrameConsumer(FrameConsumer consumer);
+    // 0 = Fill (AspectCrop), 1 = Fit (Letterbox), 2 = Stretch
+    void SetFitMode(int fitMode);
+    // false = BGRA32 (IPC output), true = RGBA32 (Vulkan texture upload)
+    void SetOutputRgba(bool rgba) { m_outputRgba = rgba; }
 
     bool Open(const std::string& videoPathUtf8, uint32_t outWidth, uint32_t outHeight,
               std::string& outError);
@@ -37,13 +41,14 @@ public:
 
 private:
     bool DecodeNextFrame();
-    void BlitAspectCropToOutput(const uint8_t* srcBgra, uint32_t srcW, uint32_t srcH,
-                                int32_t srcStride);
+    void BlitToOutput(const uint8_t* srcBgra, uint32_t srcW, uint32_t srcH, int32_t srcStride);
 
     bool             m_comInited { false };
     bool             m_mfInited { false };
     IMFSourceReader* m_reader { nullptr };
 
+    int      m_fitMode { 0 };
+    bool     m_outputRgba { false };
     uint32_t m_srcWidth { 0 };
     uint32_t m_srcHeight { 0 };
     int32_t  m_srcStride { 0 };

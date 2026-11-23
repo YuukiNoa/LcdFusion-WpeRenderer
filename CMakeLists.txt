@@ -192,6 +192,7 @@ target_compile_options(qjs-static PRIVATE
 add_executable(wpe-renderer
     src/AudioSpectrumWin32.cpp
     src/VideoPlayerWin32.cpp
+    src/WebWallpaperWin32.cpp
     src/TextLayerRenderer.cpp
     src/SceneScriptEngine.cpp
     src/ShmWriter.cpp
@@ -202,6 +203,8 @@ add_executable(wpe-renderer
 target_link_libraries(wpe-renderer PRIVATE
     wescene-core
     qjs-static
+    dwmapi
+    shlwapi
     gdiplus
     gdi32
     mfplat

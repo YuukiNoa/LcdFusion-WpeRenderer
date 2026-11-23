@@ -39,8 +39,9 @@ public:
 
 private:
     void CaptureLoop();
-    void PushSamplesAndAnalyze(const float* left, const float* right, std::size_t frameCount);
-    void ComputeBandsFromWindow();
+    void PushSamplesOnly(const float* left, const float* right, std::size_t frameCount);
+    void ComputeBandsFromWindow(float dtSec);
+    void DecayTowardSilence(float dtSec);
 
     std::atomic<bool> m_running { false };
     std::atomic<bool> m_paused { false };
@@ -49,11 +50,15 @@ private:
     mutable std::mutex m_mutex;
     AudioSpectrumData  m_spectrum {};
 
-    static constexpr std::size_t kFftSize = 1024;
-    std::array<float, kFftSize>  m_ringL {};
-    std::array<float, kFftSize>  m_ringR {};
-    std::size_t                  m_ringPos { 0 };
-    uint32_t                     m_sampleRate { 48000 };
+    // 1024-sample (~21.3 ms @ 48 kHz) capture window zero-padded to 2048-point FFT (23.4 Hz spacing)
+    // for low latency + fine low-frequency resolution without staircase artifacts.
+    static constexpr std::size_t kWindowSize = 1024;
+    static constexpr std::size_t kFftSize    = 2048;
+    std::array<float, kWindowSize> m_ringL {};
+    std::array<float, kWindowSize> m_ringR {};
+    std::array<float, kWindowSize> m_window {};
+    std::size_t                    m_ringPos { 0 };
+    uint32_t                       m_sampleRate { 48000 };
 };
 
 } // namespace lcdfusion_wpe

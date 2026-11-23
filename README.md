@@ -8,6 +8,7 @@ Standalone **x64 headless Vulkan offscreen Scene renderer** (`wpe-renderer.exe`)
 - **Privilege Isolation**: When `LcdFusion.exe` runs elevated under UAC (High Integrity), it launches `wpe-renderer.exe --ipc-pipe <base>` using `explorer.exe`'s authentic Medium Integrity desktop token (`CreateProcessWithTokenW` + `CreateEnvironmentBlock`) over scoped-DACL unidirectional named pipes (`\\.\pipe\<base>_in` / `_out`), and stamps a Medium Mandatory Label (`S:(ML;;NW;;;ME)`) onto both the pipes and shared memory mapping. `ShmWriter` requests minimum required access (`FILE_MAP_READ | FILE_MAP_WRITE`). Standard `--ipc` (`stdin`/`stdout`) remains supported for non-elevated runs and fallback.
 - **Headless Vulkan 1.1+ Offscreen Rendering**: Renders Wallpaper Engine Scene wallpapers directly into `VK_FORMAT_B8G8R8A8_UNORM` offscreen images and copies frames via persistently-mapped `HOST_VISIBLE | HOST_COHERENT` staging buffers into double-buffered Windows shared memory (`Local\LcdFusion_Wpe_*`).
 - **Native Video Wallpapers**: Decodes Wallpaper Engine `video` wallpapers natively via Windows Media Foundation (`IMFSourceReader`, x64) into the same shared-memory IPC path.
+- **Web Wallpapers (System WebView2 Offscreen)**: Renders Wallpaper Engine `web` wallpapers (`index.html`, WebGL, Spine, Live2D, Canvas, CSS) via Windows built-in Microsoft Edge WebView2 Runtime (dynamically loading `WebView2Loader.dll` or `EmbeddedBrowserWebView.dll` with zero extra deployed DLLs), mapping the wallpaper directory to `https://wallpaper.local/`, capturing GPU-composited frames via CDP `Page.startScreencast`, and bridging `window.wallpaperPropertyListener` + `window.wallpaperRegisterAudioListener`.
 - **Audio Visualization (WASAPI Loopback + FFT)**: Captures system loopback audio via Windows WASAPI and computes 256-point FFT spectrum uniforms (`g_AudioSpectrum{16,32,64}{Left,Right}`) and SceneScript `engine.registerAudioBuffers(16/32/64)`.
 - **SceneScript JS Engine (QuickJS-ng, MIT) & Built-in Text Layers (GDI+)**: Embeds [`quickjs-ng/quickjs`](https://github.com/quickjs-ng/quickjs) statically (64 MB cap, per-call interrupt timeout) for ES2023/ESM Wallpaper Engine SceneScript (`WEColor`, `WEMath`, `WEVector`, `Vec2`/`Vec3`, `createScriptProperties`, `engine`, `thisLayer`/`thisScene`, `init`/`update`/`applyUserProperties`), plus Windows GDI+ `text` layer compositing with embedded VFS `.ttf`/`.otf` fonts.
 - **No Bundled Assets**: Never packages or distributes Wallpaper Engine `assets/` or Workshop wallpapers; reads user-owned Steam directories at runtime.
@@ -24,7 +25,7 @@ To prepare a fresh checkout:
 
 ## Building (MSYS2 UCRT64)
 
-Prerequisites in `C:\msys64\ucrt64`: GCC/C++20, CMake, Ninja, Vulkan Headers/Loader, `glslang`, `SPIRV-Tools`, `Eigen3`, `nlohmann-json`, `liblz4`, `stb`.
+Prerequisites in `C:\msys64\ucrt64`: GCC/C++20, CMake, Ninja, Vulkan Headers/Loader, `glslang`, `SPIRV-Tools`, `Eigen3`, `nlohmann-json`, `liblz4`, `stb`, `webview2-loader` (headers only).
 
 ```powershell
 $env:PATH = "C:\msys64\ucrt64\bin;" + $env:PATH

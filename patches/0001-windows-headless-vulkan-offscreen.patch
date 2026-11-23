@@ -625,7 +625,7 @@ index 800df6a..ba56250 100644
      for (auto& block : m_virtual_blocks) {
          if (block.enabled) {
 diff --git a/src/Vulkan/TextureCache.cpp b/src/Vulkan/TextureCache.cpp
-index 4f76e34..bf578cb 100644
+index 4f76e34..2630db1 100644
 --- a/src/Vulkan/TextureCache.cpp
 +++ b/src/Vulkan/TextureCache.cpp
 @@ -156,10 +156,12 @@ std::optional<vvk::DeviceMemory> AllocateMemory(const vvk::Device& device, vvk::
@@ -754,7 +754,54 @@ index 4f76e34..bf578cb 100644
          VVK_CHECK(m_device.handle().WaitIdle());
      }
      return opt;
-@@ -630,21 +671,26 @@ void TextureCache::RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParame
+@@ -501,6 +542,38 @@ ImageSlotsRef TextureCache::CreateTex(Image& image) {
+     return m_tex_map[image.key];
+ }
+ 
++bool TextureCache::UpdateTexData(const std::string& key, const uint8_t* rgba, uint32_t width,
++                                 uint32_t height) {
++    if (! rgba || width == 0 || height == 0) return false;
++    auto it = m_tex_map.find(key);
++    if (it == m_tex_map.end() || it->second.slots.empty()) return false;
++
++    auto& image_paras = it->second.slots[0];
++    if (image_paras.extent.width != width || image_paras.extent.height != height) return false;
++
++    if (! m_tex_cmd) allocateCmd();
++
++    const u32 byteSize = width * height * 4u;
++    auto&     stageBuf = m_update_stage_bufs[key];
++    if (! stageBuf.handle || stageBuf.req_size < byteSize) {
++        stageBuf = VmaBufferParameters {};
++        if (CreateStagingBuffer(m_device.vma_allocator(), byteSize, stageBuf) != VK_SUCCESS) {
++            return false;
++        }
++    }
++
++    void* v_data = nullptr;
++    if (stageBuf.handle.MapMemory(&v_data) != VK_SUCCESS || ! v_data) return false;
++    std::memcpy(v_data, rgba, byteSize);
++    stageBuf.handle.UnMapMemory();
++
++    std::vector<BufferParameters> bufs { static_cast<BufferParameters>(stageBuf) };
++    std::vector<VkExtent3D>       exts { VkExtent3D { width, height, 1 } };
++    CopyImageData(bufs, exts, m_device.graphics_queue().handle, m_tex_cmd, image_paras);
++    m_device.handle().WaitIdle();
++    return true;
++}
++
+ void TextureCache::allocateCmd() {
+     const auto& pool = m_device.cmd_pool();
+     VVK_CHECK(pool.Allocate(1, VK_COMMAND_BUFFER_LEVEL_PRIMARY, m_tex_cmds));
+@@ -544,6 +617,7 @@ TextureCache::TextureCache(const Device& device): m_device(device) {}
+ TextureCache::~TextureCache() {};
+ 
+ void TextureCache::Clear() {
++    m_update_stage_bufs.clear();
+     m_tex_map.clear();
+     m_query_texs.clear();
+     m_query_map.clear();
+@@ -630,21 +704,26 @@ void TextureCache::RecGenerateMipmaps(vvk::CommandBuffer& cmd, const ImageParame
                                                         : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
  
          barrier.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -822,6 +869,31 @@ index 7c8b385..b4b10de 100644
  struct ShaderReflected {
      struct BlockedUniform {
          int    block_index;
+diff --git a/src/Vulkan/include/Vulkan/TextureCache.hpp b/src/Vulkan/include/Vulkan/TextureCache.hpp
+index a4814a2..29bc184 100644
+--- a/src/Vulkan/include/Vulkan/TextureCache.hpp
++++ b/src/Vulkan/include/Vulkan/TextureCache.hpp
+@@ -46,6 +46,8 @@ public:
+     std::optional<ExImageParameters> CreateExTex(uint32_t witdh, uint32_t height, VkFormat,
+                                                  VkImageTiling);
+     ImageSlotsRef                    CreateTex(Image&);
++    bool                             UpdateTexData(const std::string& key, const uint8_t* rgba,
++                                                   uint32_t width, uint32_t height);
+ 
+     std::optional<ImageParameters> Query(std::string_view key, TextureKey content_hash,
+                                          bool persist = false);
+@@ -60,8 +62,9 @@ private:
+     vvk::CommandBuffers               m_tex_cmds;
+     vvk::CommandBuffer                m_tex_cmd;
+ 
+-    const Device&                m_device;
+-    Map<std::string, ImageSlots> m_tex_map;
++    const Device&                         m_device;
++    Map<std::string, ImageSlots>          m_tex_map;
++    Map<std::string, VmaBufferParameters> m_update_stage_bufs;
+ 
+     struct QueryTex {
+         idx                index { 0 };
 diff --git a/src/Vulkan/include/Vulkan/VulkanExSwapchain.hpp b/src/Vulkan/include/Vulkan/VulkanExSwapchain.hpp
 index 4c4336e..6252d76 100644
 --- a/src/Vulkan/include/Vulkan/VulkanExSwapchain.hpp
@@ -1376,7 +1448,7 @@ index 6e5458b..f5c53f2 100644
      virtual void destory(const Device&, RenderingResources&)         = 0;
  
 diff --git a/src/VulkanRender/VulkanRender.cpp b/src/VulkanRender/VulkanRender.cpp
-index 9fb7776..ee275f4 100644
+index 9fb7776..73127ed 100644
 --- a/src/VulkanRender/VulkanRender.cpp
 +++ b/src/VulkanRender/VulkanRender.cpp
 @@ -37,6 +37,12 @@ constexpr uint32_t vk_command_num { 2 };
@@ -1416,10 +1488,15 @@ index 9fb7776..ee275f4 100644
  
      std::unique_ptr<StagingBuffer> m_vertex_buf { nullptr };
      std::unique_ptr<StagingBuffer> m_dyn_buf { nullptr };
-@@ -108,6 +117,12 @@ void VulkanRender::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
+@@ -108,6 +117,17 @@ void VulkanRender::compileRenderGraph(Scene& scene, rg::RenderGraph& rg) {
  void VulkanRender::UpdateCameraFillMode(Scene& scene, wallpaper::FillMode fill) {
      pImpl->UpdateCameraFillMode(scene, fill);
  };
++bool VulkanRender::updateTexture(const std::string& key, const uint8_t* rgba, uint32_t width,
++                                 uint32_t height) {
++    if (! pImpl || ! pImpl->m_inited || ! pImpl->m_device) return false;
++    return pImpl->m_device->tex_cache().UpdateTexData(key, rgba, width, height);
++}
 +bool VulkanRender::resizeOffscreen(uint32_t width, uint32_t height) {
 +    return pImpl->resizeOffscreen(width, height);
 +}
@@ -1429,7 +1506,7 @@ index 9fb7776..ee275f4 100644
  
  wallpaper::ExSwapchain* VulkanRender::exSwapchain() const { return pImpl->m_ex_swapchain.get(); };
  
-@@ -116,11 +131,7 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
+@@ -116,11 +136,7 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
  
      m_redraw_cb = info.redraw_callback;
      VkExtent2D extent { info.width, info.height };
@@ -1442,7 +1519,7 @@ index 9fb7776..ee275f4 100644
  
      std::vector<Extension> inst_exts { base_inst_exts.begin(), base_inst_exts.end() };
      std::vector<Extension> device_exts { base_device_exts.begin(), base_device_exts.end() };
-@@ -199,8 +210,13 @@ bool VulkanRender::Impl::initRes() {
+@@ -199,8 +215,13 @@ bool VulkanRender::Impl::initRes() {
          m_finpass->setPresentLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
      } else {
          m_finpass->setPresentFormat(m_ex_swapchain->format());
@@ -1456,7 +1533,7 @@ index 9fb7776..ee275f4 100644
      }
      /*
      m_testpass = std::make_unique<FinPass>(FinPass::Desc{});
-@@ -243,12 +259,28 @@ void VulkanRender::Impl::destroy() {
+@@ -243,12 +264,28 @@ void VulkanRender::Impl::destroy() {
          for (auto& p : m_passes) {
              p->destory(*m_device, m_rendering_resources);
          }
@@ -1487,7 +1564,7 @@ index 9fb7776..ee275f4 100644
  }
  
  bool VulkanRender::Impl::CreateRenderingResource(RenderingResources& rr) {
-@@ -365,7 +397,8 @@ void VulkanRender::Impl::drawFrameSwapchain() {
+@@ -365,7 +402,8 @@ void VulkanRender::Impl::drawFrameSwapchain() {
  }
  void VulkanRender::Impl::drawFrameOffscreen() {
      RenderingResources& rr    = m_rendering_resources;
@@ -1497,7 +1574,7 @@ index 9fb7776..ee275f4 100644
  
      m_finpass->setPresent(image);
  
-@@ -374,6 +407,11 @@ void VulkanRender::Impl::drawFrameOffscreen() {
+@@ -374,6 +412,11 @@ void VulkanRender::Impl::drawFrameOffscreen() {
          .pNext = nullptr,
          .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
      });
@@ -1509,7 +1586,7 @@ index 9fb7776..ee275f4 100644
      m_dyn_buf->recordUpload(rr.command);
  
      for (auto* p : m_passes) {
-@@ -382,6 +420,53 @@ void VulkanRender::Impl::drawFrameOffscreen() {
+@@ -382,6 +425,53 @@ void VulkanRender::Impl::drawFrameOffscreen() {
          }
      }
  
@@ -1563,7 +1640,7 @@ index 9fb7776..ee275f4 100644
      (void)rr.command.End();
  
      VkSubmitInfo sub_info {
-@@ -395,6 +480,32 @@ void VulkanRender::Impl::drawFrameOffscreen() {
+@@ -395,6 +485,32 @@ void VulkanRender::Impl::drawFrameOffscreen() {
      VVK_CHECK_VOID_RE(rr.fence_frame.Wait(vk_wait_time));
      VVK_CHECK_VOID_RE(rr.fence_frame.Reset());
      m_ex_swapchain->renderFrame();
@@ -1596,7 +1673,7 @@ index 9fb7776..ee275f4 100644
  }
  
  void VulkanRender::Impl::setRenderTargetSize(Scene& scene, rg::RenderGraph& rg) {
-@@ -442,13 +553,15 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
+@@ -442,13 +558,15 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
      double fboAspect = width / (double)height, sAspect = sw / sh;
      auto&  gCam    = *scene.cameras.at("global");
      auto&  gPerCam = *scene.cameras.at("global_perspective");
@@ -1613,7 +1690,7 @@ index 9fb7776..ee275f4 100644
          break;
      case FillMode::ASPECTFIT:
          if (fboAspect < sAspect) {
-@@ -460,7 +573,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
+@@ -460,7 +578,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
              gCam.SetHeight(sh);
          }
          gPerCam.SetAspect(fboAspect);
@@ -1622,7 +1699,7 @@ index 9fb7776..ee275f4 100644
          break;
      case FillMode::ASPECTCROP:
      default:
-@@ -473,7 +586,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
+@@ -473,7 +591,7 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
              gCam.SetHeight(sh);
          }
          gPerCam.SetAspect(fboAspect);
@@ -1631,7 +1708,7 @@ index 9fb7776..ee275f4 100644
          break;
      }
      gCam.Update();
-@@ -482,6 +595,9 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
+@@ -482,6 +600,9 @@ void VulkanRender::Impl::UpdateCameraFillMode(wallpaper::Scene&   scene,
  }
  
  void VulkanRender::Impl::clearLastRenderGraph() {
@@ -1642,7 +1719,7 @@ index 9fb7776..ee275f4 100644
          p->destory(*m_device, m_rendering_resources);
      }
 diff --git a/src/VulkanRender/include/VulkanRender/VulkanRender.hpp b/src/VulkanRender/include/VulkanRender/VulkanRender.hpp
-index 031fb74..506c275 100644
+index 031fb74..9881aa1 100644
 --- a/src/VulkanRender/include/VulkanRender/VulkanRender.hpp
 +++ b/src/VulkanRender/include/VulkanRender/VulkanRender.hpp
 @@ -5,7 +5,9 @@
@@ -1664,16 +1741,18 @@ index 031fb74..506c275 100644
  class VulkanRender {
  public:
      VulkanRender();
-@@ -31,6 +35,9 @@ public:
+@@ -30,6 +34,11 @@ public:
+     void clearLastRenderGraph();
      void compileRenderGraph(Scene&, rg::RenderGraph&);
      void UpdateCameraFillMode(Scene&, wallpaper::FillMode);
- 
++    bool updateTexture(const std::string& key, const uint8_t* rgba, uint32_t width,
++                       uint32_t height);
++
 +    bool resizeOffscreen(uint32_t width, uint32_t height);
 +    void setFrameCallback(FrameCallback cb);
-+
+ 
      ExSwapchain* exSwapchain() const;
      bool inited() const;
- 
 diff --git a/src/WPSceneParser.cpp b/src/WPSceneParser.cpp
 index 487c9f9..61b415f 100644
 --- a/src/WPSceneParser.cpp
@@ -2190,10 +2269,42 @@ index 3d5729c..01c646b 100644
  };
  } // namespace wallpaper
 diff --git a/src/WPTexImageParser.cpp b/src/WPTexImageParser.cpp
-index ec396e4..4c40869 100644
+index ec396e4..922b190 100644
 --- a/src/WPTexImageParser.cpp
 +++ b/src/WPTexImageParser.cpp
-@@ -110,7 +110,12 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
+@@ -34,6 +34,8 @@ using WPTexFlags = BitFlags<WPTexFlagEnum>;
+ 
+ namespace
+ {
++WPTexImageParser::VideoTexDecodeCallback g_videoTexCallback;
++
+ char* Lz4Decompress(const char* src, int size, int decompressed_size) {
+     char* dst       = new char[(usize)decompressed_size];
+     int   load_size = LZ4_decompress_safe(src, dst, size, decompressed_size);
+@@ -72,16 +74,18 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
+     header.extraHeader["texi"].val = ReadTexVesion(file);
+ 
+     header.format = ToTexFormate(file.ReadInt32());
+-    WPTexFlags flags(file.ReadUint32());
++    uint32_t   rawFlags = file.ReadUint32();
++    WPTexFlags flags(rawFlags);
+     {
+         header.isSprite     = flags[WPTexFlagEnum::sprite];
+         header.sample.wrapS = header.sample.wrapT =
+             flags[WPTexFlagEnum::clampUVs] ? TextureWrap::CLAMP_TO_EDGE : TextureWrap::REPEAT;
+         header.sample.minFilter = header.sample.magFilter =
+             flags[WPTexFlagEnum::noInterpolation] ? TextureFilter::NEAREST : TextureFilter::LINEAR;
+-        header.extraHeader["compo1"].val = flags[WPTexFlagEnum::compo1];
+-        header.extraHeader["compo2"].val = flags[WPTexFlagEnum::compo2];
+-        header.extraHeader["compo3"].val = flags[WPTexFlagEnum::compo3];
++        header.extraHeader["compo1"].val     = flags[WPTexFlagEnum::compo1];
++        header.extraHeader["compo2"].val     = flags[WPTexFlagEnum::compo2];
++        header.extraHeader["compo3"].val     = flags[WPTexFlagEnum::compo3];
++        header.extraHeader["isVideoTex"].val = (rawFlags & 0x20u) ? 1 : 0;
+     }
+ 
+     /*
+@@ -110,7 +114,12 @@ void LoadHeader(fs::IBinaryStream& file, ImageHeader& header) {
  
      header.count = file.ReadInt32();
  
@@ -2207,15 +2318,69 @@ index ec396e4..4c40869 100644
  }
  
  void SetHeaderPow2(ImageHeader& header, i32 mip_0_w, i32 mip_0_h) {
-@@ -184,11 +189,26 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
+@@ -120,6 +129,10 @@ void SetHeaderPow2(ImageHeader& header, i32 mip_0_w, i32 mip_0_h) {
+ 
+ } // namespace
+ 
++void WPTexImageParser::SetVideoTexDecodeCallback(VideoTexDecodeCallback cb) {
++    g_videoTexCallback = std::move(cb);
++}
++
+ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
+     std::string            path    = "/assets/materials/" + name + ".tex";
+     std::shared_ptr<Image> img_ptr = std::make_shared<Image>();
+@@ -184,11 +197,69 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
                      return nullptr;
                  }
              }
 -            // is image container
 -            if (img.header.extraHeader["texb"].val == 3 && img.header.type != ImageType::UNKNOWN) {
 -                int32_t w, h, n;
++            // Detect embedded MP4 video texture (TEXB0004 / isVideoTex flag / ISO BMFF 'ftyp' box)
++            bool looksLikeMp4 = (src_size >= 12 && std::memcmp(result + 4, "ftyp", 4) == 0);
++            bool isVideoTex   = (img.header.extraHeader["isVideoTex"].val != 0) ||
++                                (img.header.extraHeader["isVideoMp4"].val != 0) || looksLikeMp4;
++
++            if (isVideoTex && i_mipmap == 0 && g_videoTexCallback) {
++                // Cap decode resolution to 1280x720 preserving exact aspect ratio for smooth 30fps uploads
++                int32_t capW = mipmap.width;
++                int32_t capH = mipmap.height;
++                if (capW > 1280 || capH > 720) {
++                    double sx = 1280.0 / static_cast<double>(capW);
++                    double sy = 720.0 / static_cast<double>(capH);
++                    double s  = std::min(sx, sy);
++                    capW      = std::max(2, static_cast<int32_t>(std::lround(capW * s)) & ~1);
++                    capH      = std::max(2, static_cast<int32_t>(std::lround(capH * s)) & ~1);
++                }
++                std::vector<uint8_t> firstRgba;
++                int32_t              outW = 0, outH = 0;
++                if (g_videoTexCallback(name,
++                                       reinterpret_cast<const uint8_t*>(result),
++                                       static_cast<std::size_t>(src_size),
++                                       capW,
++                                       capH,
++                                       firstRgba,
++                                       outW,
++                                       outH) &&
++                    ! firstRgba.empty() && outW > 0 && outH > 0) {
++                    img.header.format = TextureFormat::RGBA8;
++                    mipmap.width      = outW;
++                    mipmap.height     = outH;
++                    img_slot.width    = outW;
++                    img_slot.height   = outH;
++                    SetHeaderPow2(img.header, outW, outH);
++                    const std::size_t byteLen = firstRgba.size();
++                    mipmap.data = ImageDataPtr(new uint8_t[byteLen], [](uint8_t* d) { delete[] d; });
++                    std::copy(firstRgba.begin(), firstRgba.end(), mipmap.data.get());
++                    src_size = static_cast<i32>(byteLen);
++                } else {
++                    LOG_ERROR("Embedded video texture decode failed for \"%s\"", name.c_str());
++                    delete[] result;
++                    return nullptr;
++                }
++            }
 +            // is image container (TEXB0003 / TEXB0004)
-+            if (img.header.extraHeader["texb"].val >= 3 && img.header.type != ImageType::UNKNOWN) {
++            else if (img.header.extraHeader["texb"].val >= 3 && img.header.type != ImageType::UNKNOWN) {
 +                int32_t w = 0, h = 0, n = 0;
                  auto*   data =
                      stbi_load_from_memory((const unsigned char*)result, src_size, &w, &h, &n, 4);
@@ -2237,3 +2402,32 @@ index ec396e4..4c40869 100644
                  mipmap.data = ImageDataPtr((uint8_t*)data, [](uint8_t* data) {
                      stbi_image_free((unsigned char*)data);
                  });
+diff --git a/src/WPTexImageParser.hpp b/src/WPTexImageParser.hpp
+index 0c26a0c..70b5756 100644
+--- a/src/WPTexImageParser.hpp
++++ b/src/WPTexImageParser.hpp
+@@ -2,11 +2,24 @@
+ #include "Interface/IImageParser.h"
+ #include "Fs/VFS.h"
+ 
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <vector>
++
+ namespace wallpaper
+ {
+ 
+ class WPTexImageParser : public IImageParser {
+ public:
++    using VideoTexDecodeCallback = std::function<bool(
++        const std::string& texKey, const uint8_t* mp4Bytes, std::size_t mp4Size,
++        int32_t targetW, int32_t targetH, std::vector<uint8_t>& outFirstFrameRgba,
++        int32_t& outW, int32_t& outH)>;
++
++    static void SetVideoTexDecodeCallback(VideoTexDecodeCallback cb);
++
+     WPTexImageParser(fs::VFS* vfs): m_vfs(vfs) {}
+     virtual ~WPTexImageParser() = default;
+ 
