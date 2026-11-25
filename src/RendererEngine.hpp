@@ -68,6 +68,7 @@ public:
     bool SetProperties(const std::string& propsJson, std::string& outError);
     void SetSensors(const std::string& sensorsJson);
     void SetPaused(bool paused);
+    void SetAudioCapturePaused(bool paused);
     bool RenderFrame(double deltaSec);
     void Shutdown();
 

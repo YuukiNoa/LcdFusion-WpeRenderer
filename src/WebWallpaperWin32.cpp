@@ -1557,8 +1557,10 @@ void WebWallpaperWin32::SetPaused(bool paused) {
 
 void WebWallpaperWin32::FeedAudioSpectrum(const AudioSpectrumData& audio) {
     if (! m_impl || ! m_impl->open.load() || m_impl->paused.load()) return;
-    auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_impl->lastAudioPush).count() < 40) {
+    auto          now           = std::chrono::steady_clock::now();
+    const int64_t fps           = static_cast<int64_t>(std::clamp<uint32_t>(m_impl->targetFps.load(), 1u, 60u));
+    const int64_t minIntervalMs = std::clamp<int64_t>((1000 / fps) - 8, 14, 32);
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_impl->lastAudioPush).count() < minIntervalMs) {
         return;
     }
     if (m_impl->audioPending.exchange(true)) return;

@@ -341,25 +341,35 @@ void RendererEngine::SetPaused(bool paused) {
     if (m_isWeb && m_web) m_web->SetPaused(paused);
 }
 
+void RendererEngine::SetAudioCapturePaused(bool paused) {
+    if (m_audio) m_audio->SetPaused(paused);
+}
+
 void RendererEngine::InjectTestAudioTone(float frequencyHz, float amplitude) {
     if (! m_audio) return;
     constexpr std::size_t kSamples    = 1024;
     constexpr float       kSampleRate = 48000.0f;
-    // Rich multi-band chord (sub-bass, bass, low-mid, mid, treble) so both bass-only and full-spectrum
-    // visualizers respond clearly during offline verification.
-    static constexpr float kFreqs[] = { 60.0f, 95.0f, 140.0f, 210.0f, 320.0f, 520.0f, 900.0f, 1800.0f };
-    std::array<float, kSamples> pcm {};
+    // Rich full-band stereo chord (sub-bass, bass, low-mid, vocals, presence, air) so both bass-only
+    // and stereo full-spectrum visualizers respond accurately during offline verification.
+    static constexpr float kFreqs[] = { 55.0f, 95.0f, 150.0f, 240.0f, 420.0f, 820.0f, 1650.0f, 3400.0f, 6800.0f };
+    static constexpr float kGainL[] = { 1.15f, 1.00f, 0.90f,  0.80f,  0.75f,  0.65f,  0.55f,   0.50f,   0.45f };
+    static constexpr float kGainR[] = { 0.95f, 1.15f, 0.80f,  0.95f,  0.65f,  0.80f,  0.70f,   0.60f,   0.55f };
+    std::array<float, kSamples> pcmL {};
+    std::array<float, kSamples> pcmR {};
     for (std::size_t i = 0; i < kSamples; ++i) {
-        float t = static_cast<float>(i) / kSampleRate;
-        float s = 0.0f;
-        for (float f : kFreqs) {
-            s += std::sin(2.0f * 3.14159265f * f * t);
+        float t  = static_cast<float>(i) / kSampleRate;
+        float sL = std::sin(2.0f * 3.14159265f * frequencyHz * t) * 0.7f;
+        float sR = std::sin(2.0f * 3.14159265f * (frequencyHz * 1.25f) * t) * 0.7f;
+        for (std::size_t k = 0; k < sizeof(kFreqs) / sizeof(kFreqs[0]); ++k) {
+            float w = std::sin(2.0f * 3.14159265f * kFreqs[k] * t);
+            sL += w * kGainL[k];
+            sR += w * kGainR[k];
         }
-        s += std::sin(2.0f * 3.14159265f * frequencyHz * t);
-        pcm[i] = amplitude * (s / 4.0f);
+        pcmL[i] = amplitude * (sL / 5.5f);
+        pcmR[i] = amplitude * (sR / 5.5f);
     }
     for (int k = 0; k < 8; ++k) {
-        m_audio->FeedPcmSamples(pcm.data(), pcm.data(), kSamples);
+        m_audio->FeedPcmSamples(pcmL.data(), pcmR.data(), kSamples);
     }
 }
 

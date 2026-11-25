@@ -251,7 +251,7 @@ int RunDumpMode(int argc, char** argv) {
         engine.SetSensors(sensorsJson);
     }
     if (testAudio) {
-        engine.SetPaused(true);
+        engine.SetAudioCapturePaused(true);
         engine.InjectTestAudioTone(220.0f, 1.0f);
     }
 

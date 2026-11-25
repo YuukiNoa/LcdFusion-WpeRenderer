@@ -410,6 +410,15 @@ void WasapiAudioAnalyzer::CaptureLoop() {
             continue;
         }
 
+        std::wstring activeDeviceId;
+        {
+            LPWSTR devId = nullptr;
+            if (SUCCEEDED(device->GetId(&devId)) && devId) {
+                activeDeviceId = devId;
+                CoTaskMemFree(devId);
+            }
+        }
+
         hr = device->Activate(__uuidof(IAudioClient),
                               CLSCTX_ALL,
                               nullptr,
@@ -475,13 +484,42 @@ void WasapiAudioAnalyzer::CaptureLoop() {
 
         auto lastAnalyzeTime = std::chrono::steady_clock::now();
         auto lastPacketTime  = lastAnalyzeTime;
+        auto lastDeviceCheck = lastAnalyzeTime;
+        bool deviceChanged   = false;
 
         while (m_running.load()) {
             if (m_paused.load()) {
                 WaitHighResMs(hTimer, 30.0);
                 lastAnalyzeTime = std::chrono::steady_clock::now();
                 lastPacketTime  = lastAnalyzeTime;
+                lastDeviceCheck = lastAnalyzeTime;
                 continue;
+            }
+
+            // Detect Windows default playback device switches (e.g. speakers <-> headphones/Bluetooth)
+            // even when the previous endpoint remains plugged in and never returns a WASAPI error.
+            auto checkNow = std::chrono::steady_clock::now();
+            if (! activeDeviceId.empty() &&
+                std::chrono::duration_cast<std::chrono::milliseconds>(checkNow - lastDeviceCheck).count() >= 1000) {
+                lastDeviceCheck    = checkNow;
+                IMMDevice* curDev  = nullptr;
+                if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &curDev)) && curDev) {
+                    LPWSTR curId = nullptr;
+                    if (SUCCEEDED(curDev->GetId(&curId)) && curId) {
+                        if (activeDeviceId != curId) {
+                            deviceChanged = true;
+                        }
+                        CoTaskMemFree(curId);
+                    }
+                    curDev->Release();
+                }
+                if (deviceChanged) {
+                    LOG_INFO("WasapiAudioAnalyzer: default audio endpoint changed, reconnecting loopback");
+                    m_ringL.fill(0.0f);
+                    m_ringR.fill(0.0f);
+                    m_ringPos = 0;
+                    break;
+                }
             }
 
             UINT32 packetLength = 0;
@@ -563,7 +601,7 @@ void WasapiAudioAnalyzer::CaptureLoop() {
         }
 
         cleanup();
-        if (m_running.load()) WaitHighResMs(hTimer, 250.0);
+        if (m_running.load()) WaitHighResMs(hTimer, deviceChanged ? 25.0 : 250.0);
     }
 
     if (hTimer) CloseHandle(hTimer);
