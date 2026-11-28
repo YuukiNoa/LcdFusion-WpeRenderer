@@ -308,6 +308,41 @@ int RunDumpMode(int argc, char** argv) {
     return 0;
 }
 
+void DisableProcessPowerThrottling() {
+    struct PowerThrottlingState {
+        ULONG Version;
+        ULONG ControlMask;
+        ULONG StateMask;
+    };
+    constexpr int   kProcessPowerThrottling                      = 4;
+    constexpr ULONG kProcessPowerThrottlingCurrentVersion        = 1;
+    constexpr ULONG kProcessPowerThrottlingExecutionSpeed        = 0x1;
+    constexpr ULONG kProcessPowerThrottlingIgnoreTimerResolution = 0x4;
+
+    using SetProcessInfoFn = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+    HMODULE hKernel32      = GetModuleHandleW(L"kernel32.dll");
+    if (! hKernel32) return;
+    auto fnSet = reinterpret_cast<SetProcessInfoFn>(GetProcAddress(hKernel32, "SetProcessInformation"));
+    if (! fnSet) return;
+
+    HANDLE hSelf = GetCurrentProcess();
+    // Apply each flag separately: Windows 10 does not know IGNORE_TIMER_RESOLUTION (0x4)
+    // and would reject a combined mask with ERROR_INVALID_PARAMETER.
+    PowerThrottlingState execState {
+        kProcessPowerThrottlingCurrentVersion,
+        kProcessPowerThrottlingExecutionSpeed,
+        0
+    };
+    fnSet(hSelf, kProcessPowerThrottling, &execState, sizeof(execState));
+
+    PowerThrottlingState timerState {
+        kProcessPowerThrottlingCurrentVersion,
+        kProcessPowerThrottlingIgnoreTimerResolution,
+        0
+    };
+    fnSet(hSelf, kProcessPowerThrottling, &timerState, sizeof(timerState));
+}
+
 int RunIpcMode(const std::string& pipeBaseName) {
     HANDLE hPipeIn = INVALID_HANDLE_VALUE;
     if (! pipeBaseName.empty()) {
@@ -382,6 +417,10 @@ int RunIpcMode(const std::string& pipeBaseName) {
         }
         cmdCv.notify_one();
     });
+
+    // Opt out of Windows 11 EcoQoS and Timer Resolution Throttling so offscreen rendering
+    // keeps steady frame pacing even when the host window is occluded or in the background.
+    DisableProcessPowerThrottling();
 
     // Request 1 ms timer granularity in IPC mode (via dynamic winmm lookup, zero extra import DLLs)
     // so frame pacing and audio capture wake within ~1 ms instead of Windows' default 15.6 ms tick.
